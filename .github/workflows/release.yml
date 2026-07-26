@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build TUI
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin slip-tui
+
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          staging="slip-tui-${version}-${{ matrix.target }}"
+          mkdir "$staging"
+          cp "target/${{ matrix.target }}/release/slip-tui" "$staging/"
+          cp README.md LICENSE "$staging/"
+          tar czf "${staging}.tar.gz" "$staging"
+          echo "ASSET=${staging}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${env:GITHUB_REF_NAME}".TrimStart("v")
+          $staging = "slip-tui-$version-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/slip-tui.exe" $staging
+          Copy-Item README.md, LICENSE $staging
+          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
+          "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify assets and generate checksums
+        shell: bash
+        run: |
+          shopt -s nullglob
+          assets=(dist/*.tar.gz dist/*.zip)
+          if (( ${#assets[@]} != 4 )); then
+            printf 'expected 4 release archives, found %s\n' "${#assets[@]}"
+            exit 1
+          fi
+          (
+            cd dist
+            sha256sum *.tar.gz *.zip > SHA256SUMS
+          )
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          generate_release_notes: true

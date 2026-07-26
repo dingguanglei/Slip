@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="620" viewBox="0 0 920 620" role="img" aria-labelledby="title desc">
+  <title id="title">Slip TUI login screen</title>
+  <desc id="desc">A terminal-style mock screenshot of the Slip login wizard accepting any IMAP mailbox.</desc>
+  <rect width="920" height="620" rx="18" fill="#eef3f4"/>
+  <rect x="28" y="28" width="864" height="564" rx="14" fill="#102026"/>
+  <rect x="28" y="28" width="864" height="34" rx="14" fill="#20343b"/>
+  <circle cx="52" cy="45" r="6" fill="#ff5f57"/>
+  <circle cx="74" cy="45" r="6" fill="#ffbd2e"/>
+  <circle cx="96" cy="45" r="6" fill="#28c840"/>
+  <text x="460" y="50" text-anchor="middle" font-family="SF Mono, Menlo, Consolas, monospace" font-size="13" fill="#9fb1b7">slip-tui</text>
+
+  <g font-family="SF Mono, Menlo, Consolas, monospace" font-size="19" fill="#d7e6e8">
+    <text x="74" y="112" font-size="28" font-weight="700" fill="#e7fbff">Slip</text>
+    <text x="150" y="112" fill="#7e9197">chat over email</text>
+
+    <text x="74" y="178" font-size="24" font-weight="700" fill="#78a8ff">Sign in with your mailbox</text>
+
+    <text x="74" y="234" fill="#a9b7bb">Any IMAP mailbox works. QQ, Gmail, Outlook, 163/126,</text>
+    <text x="74" y="262" fill="#a9b7bb">iCloud and Yahoo are preset; other domains ask for servers.</text>
+
+    <text x="74" y="330" font-weight="700" fill="#e7fbff">Email</text>
+    <text x="74" y="380" fill="#8fa0a6">&gt;</text>
+    <text x="108" y="380" font-weight="700" fill="#ffffff">alice@qq.com</text>
+    <rect x="252" y="358" width="12" height="28" fill="#00b894"/>
+
+    <text x="74" y="452" fill="#7f9399">QQ Mail: IMAP imap.qq.com:993 (ssl) · SMTP smtp.qq.com:465 (ssl)</text>
+
+    <text x="74" y="514" fill="#d7e6e8">Enter</text>
+    <text x="142" y="514" fill="#8fa0a6">continue</text>
+    <text x="262" y="514" fill="#53676d">·</text>
+    <text x="288" y="514" fill="#d7e6e8">Shift+Tab</text>
+    <text x="404" y="514" fill="#8fa0a6">back</text>
+    <text x="472" y="514" fill="#53676d">·</text>
+    <text x="498" y="514" fill="#d7e6e8">Esc</text>
+    <text x="548" y="514" fill="#8fa0a6">quit</text>
+  </g>
+</svg>

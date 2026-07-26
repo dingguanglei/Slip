@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">slip</title>
+  <desc id="desc">A simple folded paper note for Slip.</desc>
+  <rect width="256" height="256" rx="48" fill="#F7F0DD"/>
+  <path d="M54 70h116l32 32v84H54z" fill="#FFFBEF" stroke="#143C3E" stroke-width="10" stroke-linejoin="round"/>
+  <path d="M170 70v34h32" fill="#E2F2EC" stroke="#143C3E" stroke-width="10" stroke-linejoin="round"/>
+  <path d="M78 122h84M78 150h58" stroke="#2A9D8F" stroke-width="10" stroke-linecap="round"/>
+  <circle cx="174" cy="158" r="14" fill="#E9B44C" stroke="#143C3E" stroke-width="8"/>
+  <text x="128" y="224" text-anchor="middle" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="28" font-weight="700" fill="#143C3E">slip</text>
+</svg>

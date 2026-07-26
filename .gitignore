@@ -1,0 +1,16 @@
+/target
+models/*.gguf
+models/*.gguf_file
+.slip-cache/
+.slip/
+.slip*/
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.log
+*.db
+*.sqlite
+*.sqlite3
