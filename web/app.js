@@ -34,7 +34,7 @@ async function loadAccounts(preferred) {
   account = preferred || result.accounts[0] || ''; $('account').value = account;
   document.body.classList.toggle('signed-out', !account);
   $('login-screen').hidden = !!account;
-  if (!account) { $('status').textContent = '尚未登录'; $('first-login-address').focus(); }
+  if (!account) { $('status').title = '尚未登录'; $('status').setAttribute('aria-label','尚未登录'); $('first-login-address').focus(); }
   else { showView('chat'); await refresh(); }
 }
 function renderSessions() {
