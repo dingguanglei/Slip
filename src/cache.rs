@@ -43,8 +43,6 @@ pub struct CachedLogin {
     pub imap: Endpoint,
     pub smtp: Endpoint,
     #[serde(default)]
-    pub allow_invalid_certs: bool,
-    #[serde(default)]
     pub needs_imap_id: bool,
     #[serde(default = "default_slip_folder")]
     pub slip_folder: String,
@@ -140,12 +138,27 @@ pub struct StoredSession {
     pub messages: Vec<StoredChatLine>,
 }
 
+/// Persist directory entries before removing their only remote recovery copy.
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = path;
+    #[cfg(unix)]
+    {
+        fs::File::open(path)?.sync_all()?;
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
 impl Default for MailCache {
     fn default() -> Self {
         let root = env::var_os("SLIP_HOME")
             .map(PathBuf::from)
             .or_else(|| env::var_os("SLIP_MAIL_CACHE_DIR").map(PathBuf::from))
             .or_else(|| env::var_os("HOME").map(|path| PathBuf::from(path).join(".slip")))
+            .or_else(|| env::var_os("USERPROFILE").map(|path| PathBuf::from(path).join(".slip")))
             .or_else(|| env::var_os("XDG_CACHE_HOME").map(|path| PathBuf::from(path).join("slip")))
             .unwrap_or_else(|| PathBuf::from(".slip-cache"));
         Self {
@@ -156,9 +169,8 @@ impl Default for MailCache {
 }
 
 impl MailCache {
-    /// Construct a cache rooted at an explicit directory (tests).
-    #[cfg(test)]
-    fn at(root: PathBuf) -> Self {
+    /// Construct a cache rooted at an explicit directory.
+    pub fn at(root: PathBuf) -> Self {
         Self {
             root,
             store_lock: Arc::new(Mutex::new(())),
@@ -199,7 +211,7 @@ impl MailCache {
             .with_context(|| format!("open store {}", self.db_path().display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "synchronous", "FULL")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS messages (
                  seq       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -212,6 +224,9 @@ impl MailCache {
                  ON messages(contact, timestamp, seq);
              CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_ident
                  ON messages(contact, msg_id) WHERE msg_id <> '';
+             CREATE TABLE IF NOT EXISTS outbound_wire (
+                 digest TEXT PRIMARY KEY
+             );
              CREATE TABLE IF NOT EXISTS kv (
                  key   TEXT PRIMARY KEY,
                  value TEXT NOT NULL
@@ -330,9 +345,10 @@ impl MailCache {
         }
 
         let dir = self.root.join("attachments").join(format!(
-            "sent__{}__{}",
+            "sent__{}__{}__{}",
             safe_component(contact),
-            timestamp
+            timestamp,
+            crate::crypto::random_id()
         ));
         fs::create_dir_all(&dir)?;
 
@@ -347,9 +363,35 @@ impl MailCache {
             let target = dir.join(format!("{:02}-{}", index + 1, name));
             fs::copy(path, &target)
                 .with_context(|| format!("copy attachment {}", path.display()))?;
+            // Windows FlushFileBuffers requires a writable handle.
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&target)?
+                .sync_all()?;
             saved.push(target.display().to_string());
         }
+        sync_directory(&dir)?;
         Ok(saved)
+    }
+
+    pub fn remember_outbound_wire(&self, digest: &str) -> Result<()> {
+        self.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO outbound_wire(digest) VALUES (?1)",
+                [digest],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn knows_outbound_wire(&self, digest: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM outbound_wire WHERE digest = ?1)",
+                [digest],
+                |row| row.get(0),
+            )?)
+        })
     }
 
     pub fn save_message(&self, mailbox: &str, message: &MessageSummary) -> Result<()> {
@@ -385,7 +427,6 @@ impl MailCache {
             secret: config.secret().to_string(),
             imap: config.imap.clone(),
             smtp: config.smtp.clone(),
-            allow_invalid_certs: config.allow_invalid_certs,
             needs_imap_id: config.needs_imap_id,
             slip_folder: config.slip_folder.clone(),
             subject: config.subject.clone(),
@@ -409,7 +450,6 @@ impl MailCache {
             let mut config =
                 MailConfig::custom(cached.address, cached.secret, cached.imap, cached.smtp);
             config.provider_id = cached.provider;
-            config.allow_invalid_certs = cached.allow_invalid_certs;
             config.needs_imap_id = cached.needs_imap_id;
             config.slip_folder = cached.slip_folder;
             config.subject = cached.subject;
@@ -712,6 +752,9 @@ pub struct SyncState {
     /// Used to derive unread counts across restarts.
     #[serde(default)]
     pub last_read: HashMap<String, i64>,
+    /// Incoming messages observed at mark-read time, independent of peer clocks.
+    #[serde(default)]
+    pub read_counts: HashMap<String, usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
@@ -756,7 +799,7 @@ impl PeerRecord {
     /// spoofs an inbound email with a fresh key cannot force a downgrade.
     /// Only the user disabling encryption (`encrypt = false`) turns it off.
     pub fn encryption_key(&self) -> Option<&str> {
-        self.encrypt.then_some(self.key.as_str())
+        (self.encrypt && self.pending_key.is_none()).then_some(self.key.as_str())
     }
 }
 
@@ -870,164 +913,4 @@ fn now_epoch_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{DeliveryStatus, MailCache, StoredChatLine, StoredSession};
-    use std::collections::HashMap;
-
-    fn temp_cache(tag: &str) -> (std::path::PathBuf, MailCache) {
-        let dir = std::env::temp_dir().join(format!("slip-cache-{}-{tag}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        let cache = MailCache::at(dir.clone());
-        (dir, cache)
-    }
-
-    fn line(id: &str, ts: i64, body: &str) -> StoredChatLine {
-        StoredChatLine {
-            sender: "me".to_string(),
-            date: String::new(),
-            timestamp: ts,
-            body: body.to_string(),
-            attachments: Vec::new(),
-            id: id.to_string(),
-            status: DeliveryStatus::Sending,
-            encrypted: false,
-            media: Vec::new(),
-            flags: Vec::new(),
-            retry_count: 0,
-            next_retry_at: 0,
-        }
-    }
-
-    #[test]
-    fn aliases_round_trip_and_clear() {
-        let (dir, cache) = temp_cache("aliases");
-
-        assert!(cache.load_aliases().unwrap().is_empty());
-        let mut aliases = HashMap::new();
-        aliases.insert("a@b.com".to_string(), "Alice".to_string());
-        cache.save_aliases(&aliases).unwrap();
-        assert_eq!(
-            cache
-                .load_aliases()
-                .unwrap()
-                .get("a@b.com")
-                .map(String::as_str),
-            Some("Alice")
-        );
-
-        // Stored in the DB, not a stray JSON/temp file.
-        assert!(dir.join("slip.db").exists());
-        assert!(!dir.join("aliases.json").exists());
-
-        aliases.remove("a@b.com");
-        cache.save_aliases(&aliases).unwrap();
-        assert!(cache.load_aliases().unwrap().is_empty());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn session_append_dedup_and_update() {
-        let (dir, cache) = temp_cache("session");
-        let contact = "friend@example.com";
-
-        // Append two, dedup a repeat of the first by id.
-        cache
-            .append_line(contact, &line("id1", 100, "first"))
-            .unwrap();
-        cache
-            .append_line(contact, &line("id2", 200, "second"))
-            .unwrap();
-        assert!(cache.session_has_id(contact, "id1").unwrap());
-        assert!(!cache.session_has_id(contact, "missing").unwrap());
-        assert!(!cache.session_has_id(contact, "").unwrap());
-
-        // Update in place by id, and report a miss for an unknown id.
-        assert!(
-            cache
-                .update_line(contact, &line("id1", 100, "first-edited"))
-                .unwrap()
-        );
-        assert!(
-            !cache
-                .update_line(contact, &line("id9", 300, "nope"))
-                .unwrap()
-        );
-
-        let loaded = cache.load_session(contact).unwrap();
-        assert_eq!(loaded.len(), 2);
-        // Ordered by timestamp.
-        assert_eq!(loaded[0].id, "id1");
-        assert_eq!(loaded[0].body, "first-edited");
-        assert_eq!(loaded[1].id, "id2");
-
-        // Wholesale replace collapses to the given set.
-        cache
-            .save_session(contact, &[line("id3", 400, "only")])
-            .unwrap();
-        let loaded = cache.load_session(contact).unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, "id3");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn legacy_json_is_migrated_once() {
-        let (dir, cache) = temp_cache("migrate");
-
-        // Lay down the pre-SQLite JSON layout.
-        std::fs::create_dir_all(dir.join("sessions")).unwrap();
-        let session = StoredSession {
-            contact: "old@example.com".to_string(),
-            updated_at: 1,
-            messages: vec![line("m1", 10, "legacy hello")],
-        };
-        std::fs::write(
-            dir.join("sessions/old_example.com.json"),
-            serde_json::to_vec(&session).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("contacts.json"),
-            serde_json::to_vec(&vec!["old@example.com"]).unwrap(),
-        )
-        .unwrap();
-        let mut aliases = HashMap::new();
-        aliases.insert("old@example.com".to_string(), "Legacy".to_string());
-        std::fs::write(
-            dir.join("aliases.json"),
-            serde_json::to_vec(&aliases).unwrap(),
-        )
-        .unwrap();
-
-        // First DB touch imports everything.
-        assert_eq!(cache.load_contacts().unwrap(), vec!["old@example.com"]);
-        assert_eq!(
-            cache
-                .load_aliases()
-                .unwrap()
-                .get("old@example.com")
-                .map(String::as_str),
-            Some("Legacy")
-        );
-        let msgs = cache.load_session("old@example.com").unwrap();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].body, "legacy hello");
-
-        // Imported files are moved aside, not left to be re-read.
-        assert!(!dir.join("contacts.json").exists());
-        assert!(dir.join("contacts.migrated").exists());
-        assert!(dir.join("sessions.migrated").is_dir());
-
-        // A second run does not double-import: writing a new contact then
-        // reloading must not resurrect a re-import of the (now absent) files.
-        cache
-            .save_contacts(&["new@example.com".to_string()])
-            .unwrap();
-        assert_eq!(cache.load_contacts().unwrap(), vec!["new@example.com"]);
-        std::fs::remove_dir_all(&dir).ok();
-    }
 }

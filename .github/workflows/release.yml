@@ -1,111 +1,111 @@
 name: Release
-
 on:
   push:
-    tags:
-      - "v*"
-
+    tags: ['v*']
 permissions:
   contents: read
-
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Desktop ${{ matrix.package }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
           - os: macos-14
             target: aarch64-apple-darwin
+            package: mac
           - os: windows-2022
             target: x86_64-pc-windows-msvc
-
+            package: win
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            package: linux-arm64
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            package: linux-x64
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
-
-      - name: Build TUI
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin slip-tui
-
-      - name: Package Unix archive
-        if: runner.os != 'Windows'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check tag matches application version
+        shell: bash
+        run: node -e "if ('v'+require('./desktop/package.json').version !== process.env.GITHUB_REF_NAME) process.exit(1)"
+      - name: Install desktop packaging dependencies
+        run: npm ci --ignore-scripts
+        working-directory: desktop
+      - name: Build macOS or Windows backend
+        if: runner.os != 'Linux'
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '13.0'
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin slip-web
+      - name: Build Linux backend for glibc 2.35
+        if: runner.os == 'Linux'
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          staging="slip-tui-${version}-${{ matrix.target }}"
-          mkdir "$staging"
-          cp "target/${{ matrix.target }}/release/slip-tui" "$staging/"
-          cp README.md LICENSE "$staging/"
-          tar czf "${staging}.tar.gz" "$staging"
-          echo "ASSET=${staging}.tar.gz" >> "$GITHUB_ENV"
-
-      - name: Package Windows archive
+          python -m venv "$RUNNER_TEMP/slip-build-tools"
+          "$RUNNER_TEMP/slip-build-tools/bin/pip" install cargo-zigbuild==0.23.4 ziglang==0.13.0
+          export PATH="$RUNNER_TEMP/slip-build-tools/bin:$PATH"
+          cargo zigbuild --release --locked --target ${{ matrix.target }}.2.35 --bin slip-web
+      - name: Check Unix backend executable
+        if: runner.os != 'Windows'
+        run: target/${{ matrix.target }}/release/slip-web --help
+      - name: Check Windows backend executable
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $version = "${env:GITHUB_REF_NAME}".TrimStart("v")
-          $staging = "slip-tui-$version-${{ matrix.target }}"
-          New-Item -ItemType Directory -Path $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/slip-tui.exe" $staging
-          Copy-Item README.md, LICENSE $staging
-          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
-          "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        run: target/${{ matrix.target }}/release/slip-web.exe --help
+      - name: Check Windows child shutdown
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: target\${{ matrix.target }}\release\slip-web.exe --parent-stdio <NUL >NUL
+      - name: Package desktop application
+        run: node desktop/scripts/package.cjs ${{ matrix.package }}
+      - name: Create distributable
+        run: python desktop/scripts/archive.py ${{ matrix.package }}
+      - uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.target }}
-          path: ${{ env.ASSET }}
+          name: desktop-${{ matrix.package }}
+          path: |
+            dist/${{ github.ref_name }}/*.zip
+            dist/${{ github.ref_name }}/*.deb
           if-no-files-found: error
-          retention-days: 1
-
-  release:
-    name: Publish GitHub Release
+          retention-days: 7
+  publish:
     needs: build
     runs-on: ubuntu-24.04
     permissions:
       contents: write
-
     steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          pattern: release-*
-          path: dist
+          pattern: desktop-*
+          path: dist/release
           merge-multiple: true
-
-      - name: Verify assets and generate checksums
+      - name: Verify asset count and create checksums
         shell: bash
         run: |
+          cd dist/release
           shopt -s nullglob
-          assets=(dist/*.tar.gz dist/*.zip)
-          if (( ${#assets[@]} != 4 )); then
-            printf 'expected 4 release archives, found %s\n' "${#assets[@]}"
-            exit 1
-          fi
-          (
-            cd dist
-            sha256sum *.tar.gz *.zip > SHA256SUMS
-          )
-
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
+          assets=(*.zip *.deb)
+          test "${#assets[@]}" -eq 4
+          sha256sum "${assets[@]}" > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/*.tar.gz
-            dist/*.zip
-            dist/SHA256SUMS
+            dist/release/*.zip
+            dist/release/*.deb
+            dist/release/SHA256SUMS
+          body_path: docs/RELEASE.md
           fail_on_unmatched_files: true
-          generate_release_notes: true

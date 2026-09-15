@@ -1,148 +1,73 @@
 # Architecture
 
-Slip is a single-crate Rust application: a reusable core (transport,
-protocol, crypto, storage, orchestration) with two frontends — a terminal UI
-and a scriptable CLI. The product design lives in [DESIGN.md](DESIGN.md) and
-the wire format in [PROTOCOL.md](PROTOCOL.md); this file describes how the
-code is arranged.
+Slip has a Rust mail/chat core and an Electron desktop frontend and an embedded local Web UI. SMTP/IMAP is the
+transport; the local device is the encryption endpoint. There is no hosted chat
+backend and no browser-to-provider credential connection.
 
-## Boundaries
+## Components
 
-```text
-src/providers.rs
-  Provider registry:
-  - preset IMAP/SMTP endpoints for QQ/Gmail/Outlook/163/126/iCloud/Yahoo
-  - Security modes: ssl (implicit TLS), starttls, plain (test servers)
-  - domain auto-detection for the login wizard
+| Component | Responsibility |
+| --- | --- |
+| `core.rs` | IMAP/SMTP over TLS; PEEK fetches; IDLE; single-UID cleanup; Gmail Trash handling |
+| `protocol.rs` | MIME v1 envelope; authenticated text/media encryption; integrity checks; canonical outbound wire digests |
+| `crypto.rs` | X25519 + XSalsa20-Poly1305 identity and seals; optional private-key encryption at rest |
+| `cache.rs` | SQLite WAL with FULL synchronization; account state, peer keys, messages, outbound receipts; local media |
+| `chat.rs` | Strict sending, public-key exchange, validation, deduplication, retries, safe remote cleanup |
+| `engine.rs` | Command worker and IMAP IDLE watcher; explicit frontend cleanup policy |
+| `bin/slip-web.rs` | Loopback HTTP API, account isolation, bounded uploads, account-scoped downloads |
+| `web/` | Static HTML/CSS/JavaScript IM interface, embedded in the binary; no npm/CDN dependency |
 
-src/core.rs
-  Owns network transport:
-  - IMAP over rustls or plaintext (MailStream), STARTTLS upgrade
-  - persistent MailboxSession: select, uid_search, fetch_raw, delete,
-    ensure_folder, move_to (UID MOVE), IDLE
-  - SMTP sending of prebuilt RFC 5322 bytes (lettre send_raw)
-  - NetEase IMAP ID handshake; provider-aware login help
-  - the dedicated Slip folder config (slip_folder)
-  - legacy MIME summary parsing for the debug CLI
+The TUI and debug CLI remain consumers of the Rust core. The desktop app starts the same local Web engine. The CLI includes `chat-exchange --email` for headless peers.
 
-src/protocol.rs
-  Owns the Slip wire format (v1):
-  - build_mail: headers, text fallback, JSON envelope, media parts
-  - parse_mail_bytes: v1 (plain and box-v1), v0 legacy, future versions
-  - media manifest with kind/mime/size/sha256 integrity
+## Sending
 
-src/crypto.rs
-  Owns keys and sealing:
-  - X25519 identity keypair in identity.json (0600)
-  - fingerprints (hex SHA-256 prefix)
-  - box-v1 sealing/opening (nonce || crypto_box ciphertext)
+1. Check a usable peer key exists; unknown, disabled, or changed keys cannot send.
+2. Build an encrypted envelope and encrypt every attachment. Only an empty
+   public-key exchange may use plaintext MIME.
+3. Copy local media into a unique directory; fsync files/directories. Persist
+   the outgoing message as `sending` and its canonical wire digest.
+4. Submit ciphertext over SMTP. Persist `sent` (accepted by server) or `failed`.
+5. Retries preserve the message ID and check encryption again. Every wire
+   version is remembered so uncertain SMTP outcomes can be deduplicated.
 
-src/cache.rs
-  Owns local persistence under ~/.slip:
-  - slip.db (SQLite, WAL): a `messages` row table (one row per chat line,
-    appended in O(1), deduped by (contact, msg_id)) plus a `kv` table for
-    contacts, TOFU peers, and sync state (UID cursors, read marks). A
-    pre-SQLite `sessions/*.json` + `state/peers/contacts/aliases.json`
-    layout is imported once on first open; originals renamed to *.migrated.
-  - login.json (v2 + legacy migration), identity.json — kept as separate
-    0600 files (credentials and the identity key stay out of the DB)
-  - attachment copies for sent and received media
+## Receiving and cleanup
 
-src/chat.rs
-  Owns chat semantics (ChatClient), shared by every frontend:
-  - send: media staging, opportunistic encryption, delivery states, retry
-  - composer parsing (quote/escape-aware @path + drag-drop)
-  - sync: relocate inbox chat mail into the Slip folder, then cursor-based
-    incremental fetch + id dedup; burn or archive
-  - watch: IDLE loop with reconnect/backoff and poll fallback
-  - TOFU peer updates, key-change detection, trust management
-  - session summaries, unread derivation, read marks
+1. Subject search produces candidates only; no mail is moved based on a search hit.
+2. Fetch with `BODY.PEEK[]`; validate protocol, authenticated envelope, recipient,
+   peer key and attachment hashes before persisting any chat content.
+3. Persist media and SQLite before deleting any received copy. Corrupt, legacy,
+   wrong-recipient and unknown-key-change messages stay remote.
+4. Recognize provider-created sent copies only by a canonical MIME digest
+   recorded locally before sending, plus account/key/protocol headers. Do not
+   trust `From: me` or a matching ID alone.
+5. Delete a single UID. Gmail first moves the validated copy to its special-use
+   Trash, then purges its Trash UID. Never use a bare `EXPUNGE`.
+6. Report retained/unresolved cleanup counts. Cleanup mode rescans candidates,
+   so a failed deletion or a retained message is not hidden behind an advanced
+   cursor. Non-cleanup CLI sync retains incremental cursor behavior.
 
-src/engine.rs
-  Frontend-agnostic orchestration (Engine):
-  - owns the worker + watcher threads and the Command/Event channels
-  - a frontend only sends Commands and drains Events; it never touches
-    the network or the store directly
+A per-client sync mutex serializes the watcher and manual sync. SQLite handles
+concurrent readers; read-modify-write peer/contact operations use the shared
+cache lock. Unreadable mail never reserves a deduplication ID. Historical
+incomplete placeholders can be replaced by subsequently verified content.
 
-src/imgview.rs  Decode image bytes to ratatui half-block thumbnail Lines.
-src/tui.rs      Ratatui view layer over the Engine (threads below).
-src/cli.rs      Stable JSON command-line entry points.
-src/llm.rs      Optional local GGUF analysis for the debug reader.
-```
+## Web boundary
 
-## Threads (via the Engine)
+The service listens on `127.0.0.1`, checks Host, requires a random Bearer token
+for all account/message/media APIs, provides no CORS grant, and sends no-store
+and CSP headers. Eight worker threads bound HTTP concurrency. Web explicitly
+enables cleanup regardless of the TUI environment preference.
 
-```text
-┌────────────┐   Event (mpsc)    ┌──────────────┐
-│  frontend  │◄──────────────────│ worker thread│──► IMAP sync connection
-│ (TUI/GUI)  │──────────────────►│ (send/sync)  │──► SMTP connection
-└────────────┘  Command (mpsc)   └──────────────┘
-       ▲          via Engine      ┌──────────────┐
-       └──────── Event ───────────│ watcher      │──► IMAP IDLE connection
-                                  │ thread       │    (INBOX)
-                                  └──────────────┘
-```
+Uploads contain bytes and names, never host paths. Media downloads identify an
+account, contact, message ID and media index; the canonical file path must be
+within that account's store. HTML is rendered as text. Raster images use local
+Blob previews; other files download as octet streams.
 
-`Engine::start` spawns the threads and hands back the two channels. The
-frontend never blocks on the network: it renders state and turns input into
-Commands, draining Events each frame (`try_next`) or blocking with
-`recv_timeout`. The worker owns all store mutations triggered by commands;
-the watcher runs its own incremental syncs when IDLE fires and pushes
-results as Events. A GUI would drive the same Engine identically.
+## Desktop process boundary
 
-## Data flow
-
-Sending:
-
-```text
-composer input
-  -> chat::parse_composer (@path tokens)
-  -> protocol::MediaSource::from_path (classify, hash)
-  -> cache: outgoing attachment copies + line (status=sending)
-  -> protocol::build_mail (+ crypto seal when peer key is trusted)
-  -> core::send_raw_mail (SMTP)
-  -> cache: line status=sent | failed(+/retry)
-```
-
-Receiving:
-
-```text
-IDLE wake (or /sync)
-  -> relocate: MOVE inbox [slip/chat] mail into the Slip folder
-  -> select the Slip folder, read its cursor from slip.db
-  -> UID SEARCH UID <last+1>:* SUBJECT "[slip/chat]"
-  -> fetch raw bytes -> protocol::parse_mail_bytes
-  -> drop inbound mail claiming to be from us (anti-forgery)
-  -> TOFU peer update (record / key-change flag; no plaintext downgrade)
-  -> media bytes written under attachments/, hashes verified
-  -> session line insert (dedup by Slip id)
-  -> archive in the Slip folder, or burn when SLIP_BURN is set
-     (only when fully parsed; unreadable/incomplete mail stays)
-  -> cursor advance, notify UI (bell, OSC 9, unread)
-  -> a fallback pass sweeps the inbox for any mail a move missed
-```
-
-## Persistence format
-
-JSON-on-disk, one file per concern, to stay inspectable pre-1.0. Sessions
-are per-contact arrays of message records; serde defaults keep files written
-by the QQ/Gmail-era MVP readable. A move to SQLite stays on the roadmap for
-when the schema stabilizes.
-
-## Failure handling
-
-- Local persistence always precedes remote deletion; a failed burn is
-  retried next sync and deduplicated by message id.
-- Sends persist as `sending` before SMTP and settle to `sent`/`failed`;
-  `/retry` re-sends under the same id, so double delivery dedups.
-- The watcher reconnects with capped exponential backoff and degrades to
-  polling when the server lacks IDLE.
-- Unreadable Slip mail (future versions, undecryptable payloads) is shown
-  as a placeholder and never burned.
-
-## Rust-only policy
-
-Slip contains no TypeScript/JavaScript, no Node manifests, and no vendored
-frontend runtime code. Reference products may inform interaction patterns,
-but implementation is written and reviewed as Rust. TLS is pure Rust
-(rustls); no system OpenSSL is required.
+`desktop/main.cjs` starts `slip-web --parent-stdio` with a restricted environment
+and an ephemeral loopback port. It creates an isolated renderer with Node.js
+disabled, denies external navigation and permission requests, and manages
+native attachment downloads. Closing the parent pipe terminates the backend.
+The desktop package contains only the allowlisted application resources and
+the backend for its target architecture. No account state is shipped.

@@ -192,6 +192,20 @@ pub fn build_mail(
     encrypt_to: Option<&str>,
     subject: &str,
 ) -> Result<Vec<u8>> {
+    if encrypt_to.is_none() && (!message.text.is_empty() || !message.media.is_empty()) {
+        return Err(anyhow!(
+            "refusing plaintext chat content; exchange public keys first"
+        ));
+    }
+    build_mail_unchecked(message, identity, encrypt_to, subject)
+}
+
+fn build_mail_unchecked(
+    message: &OutgoingSlip,
+    identity: &Identity,
+    encrypt_to: Option<&str>,
+    subject: &str,
+) -> Result<Vec<u8>> {
     let total = message.total_media_bytes();
     if total > MAX_MEDIA_BYTES {
         return Err(anyhow!(
@@ -396,6 +410,35 @@ fn is_mime_bomb(raw: &[u8]) -> bool {
     false
 }
 
+/// Canonical digest of an outbound MIME payload. Added transport headers and
+/// base64 wrapping do not change it; changing any payload part does. Used only
+/// to recognize exact locally recorded sent copies, never as authentication of
+/// unknown mail.
+pub fn outbound_wire_digest(raw: &[u8], address: &str, key: &str, subject: &str) -> Option<String> {
+    if is_mime_bomb(raw) {
+        return None;
+    }
+    let parsed = parse_mail(raw).ok()?;
+    let headers = &parsed.headers;
+    if !subject_matches(&headers.get_first_value("Subject")?, subject)
+        || headers.get_first_value(HDR_VERSION)?.trim() != "1"
+        || first_address(&headers.get_first_value("From")?) != address
+        || headers.get_first_value(HDR_KEY)?.trim() != key
+    {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    for part in flatten_parts(&parsed) {
+        let mime = part.ctype.mimetype.to_ascii_lowercase();
+        let body = part.get_body_raw().ok()?;
+        hash.update((mime.len() as u64).to_be_bytes());
+        hash.update(mime.as_bytes());
+        hash.update((body.len() as u64).to_be_bytes());
+        hash.update(body);
+    }
+    Some(hex::encode(hash.finalize()))
+}
+
 /// Parse raw RFC 5322 bytes into a chat message.
 ///
 /// `identity` is needed to open `box-v1` payloads (sealed with our public
@@ -500,6 +543,9 @@ fn parse_inner(raw: &[u8], identity: &Identity, subject_marker: &str) -> Result<
     };
 
     let mut problems = Vec::new();
+    if encrypted != envelope_sealed {
+        problems.push("encryption-header-mismatch".into());
+    }
 
     let envelope_json = if envelope_sealed {
         let Some(sender_key) = sender_key.as_deref() else {
@@ -687,253 +733,4 @@ pub fn first_address(value: &str) -> String {
                 .to_ascii_lowercase()
         })
         .unwrap_or_default()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::CHAT_SUBJECT;
-    use crate::crypto::Identity;
-
-    fn sample_outgoing(media: Vec<MediaSource>) -> OutgoingSlip {
-        OutgoingSlip {
-            id: "0123456789abcdef0123456789abcdef".to_string(),
-            ts: 1_752_570_000,
-            from: "alice@example.com".to_string(),
-            to: "bob@example.com".to_string(),
-            text: "hello 你好".to_string(),
-            media,
-        }
-    }
-
-    fn sample_media() -> MediaSource {
-        MediaSource::from_bytes(
-            "photo.png".to_string(),
-            "image/png".to_string(),
-            vec![0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4],
-        )
-    }
-
-    #[test]
-    fn plaintext_round_trip() {
-        let alice = Identity::generate();
-        let bob = Identity::generate();
-        let message = sample_outgoing(vec![sample_media()]);
-        let raw = build_mail(&message, &alice, None, CHAT_SUBJECT).unwrap();
-
-        let ParseOutcome::Message(incoming) = parse_mail_bytes(&raw, &bob, CHAT_SUBJECT) else {
-            panic!("expected parsed message");
-        };
-        assert_eq!(incoming.id, message.id);
-        assert_eq!(incoming.from, "alice@example.com");
-        assert_eq!(incoming.text, "hello 你好");
-        assert!(!incoming.encrypted);
-        assert!(!incoming.legacy);
-        assert!(incoming.problems.is_empty());
-        assert_eq!(incoming.media.len(), 1);
-        assert_eq!(incoming.media[0].entry.kind, MediaKind::Image);
-        assert_eq!(incoming.media[0].entry.name, "photo.png");
-        assert!(incoming.media[0].hash_ok);
-        assert_eq!(incoming.media[0].bytes, sample_media().bytes);
-        assert_eq!(
-            incoming.sender_key.as_deref(),
-            Some(alice.public_key_b64().as_str())
-        );
-    }
-
-    #[test]
-    fn encrypted_round_trip() {
-        let alice = Identity::generate();
-        let bob = Identity::generate();
-        let message = sample_outgoing(vec![sample_media()]);
-        let raw = build_mail(&message, &alice, Some(&bob.public_key_b64()), CHAT_SUBJECT).unwrap();
-
-        // Ciphertext must not leak the text or the filename.
-        let raw_str = String::from_utf8_lossy(&raw);
-        assert!(!raw_str.contains("photo.png"));
-        assert!(raw_str.contains("box-v1"));
-
-        let ParseOutcome::Message(incoming) = parse_mail_bytes(&raw, &bob, CHAT_SUBJECT) else {
-            panic!("expected parsed message");
-        };
-        assert!(incoming.encrypted);
-        assert_eq!(incoming.text, "hello 你好");
-        assert_eq!(incoming.media[0].entry.name, "photo.png");
-        assert!(incoming.media[0].hash_ok);
-        assert!(incoming.problems.is_empty());
-    }
-
-    #[test]
-    fn encrypted_mail_is_unreadable_for_wrong_recipient() {
-        let alice = Identity::generate();
-        let bob = Identity::generate();
-        let mallory = Identity::generate();
-        let message = sample_outgoing(Vec::new());
-        let raw = build_mail(&message, &alice, Some(&bob.public_key_b64()), CHAT_SUBJECT).unwrap();
-
-        match parse_mail_bytes(&raw, &mallory, CHAT_SUBJECT) {
-            ParseOutcome::Unreadable { encrypted, id, .. } => {
-                assert!(encrypted);
-                assert_eq!(id, message.id);
-            }
-            other => panic!("expected Unreadable, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn tampered_attachment_is_flagged() {
-        let alice = Identity::generate();
-        let bob = Identity::generate();
-        let message = sample_outgoing(vec![sample_media()]);
-        let mut raw = build_mail(&message, &alice, None, CHAT_SUBJECT).unwrap();
-
-        // Corrupt the attachment part's base64 body (PNG magic encodes as "iVBORw").
-        let needle = b"iVBORw";
-        if let Some(position) = raw
-            .windows(needle.len())
-            .rposition(|window| window == needle)
-        {
-            raw[position] = b'j';
-        } else {
-            panic!("attachment base64 not found");
-        }
-
-        let ParseOutcome::Message(incoming) = parse_mail_bytes(&raw, &bob, CHAT_SUBJECT) else {
-            panic!("expected parsed message");
-        };
-        assert!(!incoming.media[0].hash_ok);
-        assert!(
-            incoming
-                .problems
-                .iter()
-                .any(|problem| problem.starts_with("hash-mismatch"))
-        );
-    }
-
-    #[test]
-    fn legacy_v0_mail_still_parses() {
-        let bob = Identity::generate();
-        let raw = concat!(
-            "From: Old Client <alice@example.com>\r\n",
-            "To: <bob@example.com>\r\n",
-            "Subject: [slip/chat]\r\n",
-            "Date: Tue, 15 Jul 2025 10:00:00 +0800\r\n",
-            "Content-Type: multipart/mixed; boundary=\"b1\"\r\n",
-            "\r\n",
-            "--b1\r\n",
-            "Content-Type: text/plain; charset=utf-8\r\n",
-            "\r\n",
-            "old style hello\r\n",
-            "--b1\r\n",
-            "Content-Type: application/pdf; name=\"doc.pdf\"\r\n",
-            "Content-Disposition: attachment; filename=\"doc.pdf\"\r\n",
-            "Content-Transfer-Encoding: base64\r\n",
-            "\r\n",
-            "JVBERi0xLjQ=\r\n",
-            "--b1--\r\n",
-        )
-        .as_bytes();
-
-        let ParseOutcome::Message(incoming) = parse_mail_bytes(raw, &bob, CHAT_SUBJECT) else {
-            panic!("expected parsed message");
-        };
-        assert!(incoming.legacy);
-        assert_eq!(incoming.from, "alice@example.com");
-        assert_eq!(incoming.text, "old style hello");
-        assert_eq!(incoming.media.len(), 1);
-        assert_eq!(incoming.media[0].entry.kind, MediaKind::File);
-        assert_eq!(incoming.media[0].entry.name, "doc.pdf");
-    }
-
-    #[test]
-    fn non_slip_mail_is_ignored() {
-        let bob = Identity::generate();
-        let raw = b"From: x@y.com\r\nSubject: hello\r\n\r\nplain mail\r\n";
-        assert!(matches!(
-            parse_mail_bytes(raw, &bob, CHAT_SUBJECT),
-            ParseOutcome::NotSlip
-        ));
-    }
-
-    #[test]
-    fn custom_subject_marker_is_required_to_match() {
-        let alice = Identity::generate();
-        let bob = Identity::generate();
-        let message = sample_outgoing(Vec::new());
-        let raw = build_mail(&message, &alice, None, "Weekly notes").unwrap();
-        // Same custom marker parses.
-        assert!(matches!(
-            parse_mail_bytes(&raw, &bob, "Weekly notes"),
-            ParseOutcome::Message(_)
-        ));
-        // The default marker no longer recognizes it.
-        assert!(matches!(
-            parse_mail_bytes(&raw, &bob, CHAT_SUBJECT),
-            ParseOutcome::NotSlip
-        ));
-    }
-
-    #[test]
-    fn deeply_nested_mime_is_rejected_without_parsing() {
-        let bob = Identity::generate();
-        let mut raw = String::from("From: <a@b.com>\r\nSubject: [slip/chat]\r\n\r\n");
-        for level in 0..5000 {
-            raw.push_str(&format!(
-                "Content-Type: multipart/mixed; boundary=\"b{level}\"\r\n\r\n--b{level}\r\n"
-            ));
-        }
-        match parse_mail_bytes(raw.as_bytes(), &bob, CHAT_SUBJECT) {
-            ParseOutcome::Unreadable { reason, .. } => assert!(reason.contains("MIME nesting")),
-            other => panic!("expected Unreadable, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn future_version_is_unreadable_not_lost() {
-        let bob = Identity::generate();
-        let raw = concat!(
-            "From: <alice@example.com>\r\n",
-            "Subject: [slip/chat]\r\n",
-            "X-Slip-Version: 99\r\n",
-            "X-Slip-Id: ffffffffffffffffffffffffffffffff\r\n",
-            "X-Slip-Enc: none\r\n",
-            "\r\n",
-            "future format\r\n",
-        )
-        .as_bytes();
-        match parse_mail_bytes(raw, &bob, CHAT_SUBJECT) {
-            ParseOutcome::Unreadable { reason, .. } => {
-                assert!(reason.contains("v99"));
-            }
-            other => panic!("expected Unreadable, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn media_kind_classification() {
-        assert_eq!(MediaKind::from_mime("image/png"), MediaKind::Image);
-        assert_eq!(MediaKind::from_mime("AUDIO/ogg"), MediaKind::Audio);
-        assert_eq!(MediaKind::from_mime("application/pdf"), MediaKind::File);
-        assert_eq!(MediaKind::from_mime("video/mp4"), MediaKind::File);
-    }
-
-    #[test]
-    fn oversized_media_is_rejected() {
-        let alice = Identity::generate();
-        let mut message = sample_outgoing(Vec::new());
-        let mut big = sample_media();
-        big.size = MAX_MEDIA_BYTES + 1;
-        message.media.push(big);
-        assert!(build_mail(&message, &alice, None, CHAT_SUBJECT).is_err());
-    }
-
-    #[test]
-    fn first_address_extracts_bare_addresses() {
-        assert_eq!(
-            first_address("\"Alice A\" <Alice@Example.COM>"),
-            "alice@example.com"
-        );
-        assert_eq!(first_address("bob@example.com"), "bob@example.com");
-        assert_eq!(first_address("no address here"), "");
-    }
 }

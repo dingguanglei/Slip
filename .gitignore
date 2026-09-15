@@ -14,3 +14,20 @@ models/*.gguf_file
 *.db
 *.sqlite
 *.sqlite3
+
+/dist/
+
+/desktop/node_modules/
+/desktop/staging/
+
+# Local task records and compiler scratch files
+/task_plan.md
+/findings.md
+/progress.md
+/.intentionally-empty-file.o
+
+__pycache__/
+*.pyc
+/desktop/tests/
+/scripts/
+/docs/superpowers/

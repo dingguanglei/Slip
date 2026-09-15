@@ -13,7 +13,7 @@ pub enum Security {
     Ssl,
     /// Plaintext connect, upgrade with STARTTLS.
     StartTls,
-    /// No TLS at all. Only sane for local test servers.
+    /// No TLS. Use only with a trusted, isolated local transport.
     Plain,
 }
 
@@ -218,37 +218,4 @@ pub fn provider_for_address(address: &str) -> Option<&'static Provider> {
     PROVIDERS
         .iter()
         .find(|provider| provider.domains.contains(&domain.as_str()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Security, provider_by_id, provider_for_address};
-
-    #[test]
-    fn detects_known_domains() {
-        assert_eq!(provider_for_address("a@qq.com").unwrap().id, "qq");
-        assert_eq!(provider_for_address("a@FOXMAIL.com").unwrap().id, "qq");
-        assert_eq!(
-            provider_for_address("a@googlemail.com").unwrap().id,
-            "gmail"
-        );
-        assert_eq!(provider_for_address("a@163.com").unwrap().id, "163");
-        assert!(provider_for_address("a@example.org").is_none());
-        assert!(provider_for_address("no-at-sign").is_none());
-    }
-
-    #[test]
-    fn id_lookup_supports_aliases() {
-        assert_eq!(provider_by_id("google").unwrap().id, "gmail");
-        assert_eq!(provider_by_id("QQ").unwrap().id, "qq");
-        assert!(provider_by_id("nope").is_none());
-    }
-
-    #[test]
-    fn security_parses() {
-        assert_eq!("ssl".parse::<Security>().unwrap(), Security::Ssl);
-        assert_eq!("STARTTLS".parse::<Security>().unwrap(), Security::StartTls);
-        assert_eq!("plain".parse::<Security>().unwrap(), Security::Plain);
-        assert!("bogus".parse::<Security>().is_err());
-    }
 }

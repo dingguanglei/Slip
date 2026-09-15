@@ -56,6 +56,12 @@ enum Command {
         email: String,
     },
 
+    /// Exchange a public key without sending plaintext chat content.
+    ChatExchange {
+        #[arg(long)]
+        email: String,
+    },
+
     /// Set a local display name for a contact (empty --name clears it).
     ChatName {
         #[arg(long)]
@@ -76,8 +82,7 @@ enum Command {
 
     /// Sync new Slip chat mail into local sessions (cursor-based).
     ///
-    /// Chat mail is moved out of the inbox into the dedicated Slip folder and
-    /// archived there. Pass --burn to instead delete it after local save.
+    /// Reads mail in place. Pass --burn to remove validated chat after local save.
     ChatSync {
         #[arg(long, default_value = "INBOX")]
         mailbox: String,
@@ -316,6 +321,10 @@ pub fn run() -> Result<()> {
                 "ok": true,
                 "contacts": client.add_contact(&email)?
             }))
+        }
+        Command::ChatExchange { email } => {
+            chat_client(core)?.exchange_key(&email)?;
+            print_json(&serde_json::json!({"ok":true}))
         }
         Command::ChatName { email, name } => {
             let client = chat_client(core)?;

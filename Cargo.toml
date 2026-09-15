@@ -1,13 +1,13 @@
 [package]
 name = "slip"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-default-run = "slip-tui"
+default-run = "slip-web"
 description = "Chat over email: any IMAP/SMTP mailbox becomes a messenger"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/dingguanglei/Slip"
-keywords = ["email", "chat", "imap", "smtp", "tui"]
+keywords = ["email", "chat", "imap", "smtp", "encryption"]
 categories = ["command-line-utilities", "email"]
 
 [dependencies]
@@ -32,3 +32,5 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+tiny_http = "0.12"

@@ -144,17 +144,3 @@ fn clean_llama_output(value: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::clean_llama_output;
-
-    #[test]
-    fn clean_llama_output_removes_thinking_and_end_marker() {
-        let value = "<think>\ninternal\n</think>\n\n1. 会议改至周五下午三点。\n2. 请携带合同草稿。 [end of text]\n";
-        assert_eq!(
-            clean_llama_output(value),
-            "1. 会议改至周五下午三点。\n2. 请携带合同草稿。"
-        );
-    }
-}

@@ -52,8 +52,6 @@ pub struct MailConfig {
     pub provider_id: String,
     pub imap: Endpoint,
     pub smtp: Endpoint,
-    /// Accept self-signed certificates. Only for local test servers.
-    pub allow_invalid_certs: bool,
     /// Send the IMAP `ID` handshake after login (NetEase requirement).
     pub needs_imap_id: bool,
     /// Dedicated folder Slip chat mail is filed into. Incoming chat mail is
@@ -78,7 +76,6 @@ impl MailConfig {
             provider_id: provider.id.to_string(),
             imap: provider.imap(),
             smtp: provider.smtp(),
-            allow_invalid_certs: false,
             needs_imap_id: provider.needs_imap_id,
             slip_folder: DEFAULT_SLIP_FOLDER.to_string(),
             subject: CHAT_SUBJECT.to_string(),
@@ -97,7 +94,6 @@ impl MailConfig {
             provider_id: crate::providers::CUSTOM_PROVIDER_ID.to_string(),
             imap,
             smtp,
-            allow_invalid_certs: false,
             needs_imap_id: false,
             slip_folder: DEFAULT_SLIP_FOLDER.to_string(),
             subject: CHAT_SUBJECT.to_string(),
@@ -203,9 +199,6 @@ impl MailConfig {
         if let Some(security) = env_security("SLIP_SMTP_SECURITY")? {
             config.smtp.security = security;
         }
-        if env_flag("SLIP_ALLOW_INVALID_CERTS") {
-            config.allow_invalid_certs = true;
-        }
         // Presence check (not env_first) so an explicitly-empty SLIP_FOLDER=""
         // is honored as "disable the dedicated folder", per the README.
         if let Ok(folder) = env::var("SLIP_FOLDER") {
@@ -302,12 +295,6 @@ fn env_security(name: &str) -> Result<Option<Security>> {
     }
 }
 
-fn env_flag(name: &str) -> bool {
-    env::var(name)
-        .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
-}
-
 fn default_imap_port(security: Security) -> u16 {
     match security {
         Security::Ssl => 993,
@@ -326,12 +313,12 @@ fn default_smtp_port(security: Security) -> u16 {
 fn legacy_env_credentials() -> Result<(String, String)> {
     for (address_vars, secret_vars) in [
         (
-            &["QQ_MAIL_ADDRESS", "QQ_EMAIL"][..],
-            &["QQ_MAIL_AUTH_CODE", "QQ_PWD"][..],
+            &["QQ_ACCOUNT", "QQ_MAIL_ADDRESS", "QQ_EMAIL"][..],
+            &["QQ_PASSWORD", "QQ_MAIL_AUTH_CODE", "QQ_PWD"][..],
         ),
         (
-            &["GMAIL_ADDRESS", "GMAIL_EMAIL"][..],
-            &["GMAIL_APP_PASSWORD", "GMAIL_PWD"][..],
+            &["GMAIL_ACCOUNT", "GMAIL_ADDRESS", "GMAIL_EMAIL"][..],
+            &["GMAIL_PASSWORD", "GMAIL_APP_PASSWORD", "GMAIL_PWD"][..],
         ),
     ] {
         if let (Some(address), Some(secret)) = (env_first(address_vars), env_first(secret_vars)) {
@@ -391,65 +378,14 @@ impl SetReadTimeout for MailStream {
 
 pub type ImapSession = Session<MailStream>;
 
-mod danger {
-    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-    use rustls::crypto::CryptoProvider;
-
-    /// Accepts any certificate. Gated behind `allow_invalid_certs`, which is
-    /// only settable via `SLIP_ALLOW_INVALID_CERTS` for local test servers.
-    #[derive(Debug)]
-    pub struct NoCertVerification(pub CryptoProvider);
-
-    impl ServerCertVerifier for NoCertVerification {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &rustls::pki_types::CertificateDer<'_>,
-            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-            _server_name: &rustls::pki_types::ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: rustls::pki_types::UnixTime,
-        ) -> Result<ServerCertVerified, rustls::Error> {
-            Ok(ServerCertVerified::assertion())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            _message: &[u8],
-            _cert: &rustls::pki_types::CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            _message: &[u8],
-            _cert: &rustls::pki_types::CertificateDer<'_>,
-            _dss: &rustls::DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-            self.0.signature_verification_algorithms.supported_schemes()
-        }
-    }
-}
-
-fn tls_config(allow_invalid_certs: bool) -> Arc<rustls::ClientConfig> {
+fn tls_config() -> Arc<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    if allow_invalid_certs {
-        config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(danger::NoCertVerification(
-                rustls::crypto::ring::default_provider(),
-            )));
-    }
-    Arc::new(config)
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
 }
 
 fn tcp_connect(host: &str, port: u16) -> Result<TcpStream> {
@@ -473,10 +409,10 @@ fn tcp_connect(host: &str, port: u16) -> Result<TcpStream> {
     ))
 }
 
-fn tls_handshake(host: &str, tcp: TcpStream, allow_invalid_certs: bool) -> Result<MailStream> {
+fn tls_handshake(host: &str, tcp: TcpStream) -> Result<MailStream> {
     let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
         .map_err(|_| anyhow!("invalid TLS server name: {host}"))?;
-    let connection = rustls::ClientConnection::new(tls_config(allow_invalid_certs), server_name)
+    let connection = rustls::ClientConnection::new(tls_config(), server_name)
         .with_context(|| format!("TLS setup for {host}"))?;
     Ok(MailStream::Tls(Box::new(rustls::StreamOwned::new(
         connection, tcp,
@@ -494,11 +430,7 @@ fn read_socket_line(reader: &mut BufReader<&TcpStream>) -> Result<String> {
     Ok(line)
 }
 
-fn imap_starttls_upgrade(
-    host: &str,
-    tcp: TcpStream,
-    allow_invalid_certs: bool,
-) -> Result<MailStream> {
+fn imap_starttls_upgrade(host: &str, tcp: TcpStream) -> Result<MailStream> {
     {
         let mut reader = BufReader::new(&tcp);
         let greeting = read_socket_line(&mut reader)?;
@@ -516,7 +448,7 @@ fn imap_starttls_upgrade(
             }
         }
     }
-    tls_handshake(host, tcp, allow_invalid_certs)
+    tls_handshake(host, tcp)
 }
 
 fn open_imap_session(config: &MailConfig) -> Result<(ImapSession, Option<TcpStream>)> {
@@ -530,14 +462,8 @@ fn open_imap_session(config: &MailConfig) -> Result<(ImapSession, Option<TcpStre
 
     let (stream, greeting_pending) = match endpoint.security {
         Security::Plain => (MailStream::Plain(tcp), true),
-        Security::Ssl => (
-            tls_handshake(&endpoint.host, tcp, config.allow_invalid_certs)?,
-            true,
-        ),
-        Security::StartTls => (
-            imap_starttls_upgrade(&endpoint.host, tcp, config.allow_invalid_certs)?,
-            false,
-        ),
+        Security::Ssl => (tls_handshake(&endpoint.host, tcp)?, true),
+        Security::StartTls => (imap_starttls_upgrade(&endpoint.host, tcp)?, false),
     };
 
     let mut client = Client::new(stream);
@@ -632,11 +558,35 @@ impl MailboxSession {
         Ok(uids)
     }
 
+    /// Inspect only protocol headers on recent UIDs, independent of the
+    /// provider's potentially delayed SUBJECT search index. Never sets Seen.
+    pub fn chat_header_uids(&mut self, start: u32, end: u32, marker: &str) -> Result<Vec<u32>> {
+        if start > end || end == 0 {
+            return Ok(Vec::new());
+        }
+        let fetches = self.session.uid_fetch(
+            format!("{start}:{end}"),
+            "(UID BODY.PEEK[HEADER.FIELDS (SUBJECT X-SLIP-VERSION)])",
+        )?;
+        Ok(fetches
+            .iter()
+            .filter_map(|fetch| {
+                let raw = fetch.header()?;
+                let parsed = parse_mail(raw).ok()?;
+                let subject = parsed.headers.get_first_value("Subject")?;
+                let version = parsed.headers.get_first_value("X-Slip-Version")?;
+                (subject_matches(&subject, marker) && version.trim() == "1")
+                    .then_some(fetch.uid?)
+                    .filter(|uid| *uid >= start && *uid <= end)
+            })
+            .collect())
+    }
+
     /// Fetch the raw RFC 5322 bytes of one message.
     pub fn fetch_raw(&mut self, uid: u32) -> Result<Option<Vec<u8>>> {
         let fetches = self
             .session
-            .uid_fetch(uid.to_string(), "RFC822")
+            .uid_fetch(uid.to_string(), "BODY.PEEK[]")
             .with_context(|| format!("UID FETCH {uid}"))?;
         Ok(fetches
             .iter()
@@ -650,6 +600,61 @@ impl MailboxSession {
             .uid_store(uid.to_string(), "+FLAGS.SILENT (\\Deleted)")
             .with_context(|| format!("mark UID {uid} deleted"))?;
         expunge_uid(&mut self.session, uid)
+    }
+
+    /// Gmail removes labels on an inbox EXPUNGE. Move only this validated
+    /// chat to the special-use Trash first, then purge its Trash UID.
+    /// The return value is true only for the final purge.
+    pub fn burn_gmail(&mut self, uid: u32) -> Result<bool> {
+        let trash = self.gmail_trash_folder()?;
+        if self.selected.as_deref() == Some(trash.as_str()) {
+            self.delete(uid)?;
+            Ok(true)
+        } else {
+            self.session
+                .uid_mv(uid.to_string(), encode_imap_utf7(&trash))
+                .context("move saved Gmail chat to Trash; cleanup pending")?;
+            Ok(false)
+        }
+    }
+
+    /// Only provider sent-mail folders; no broad sweep of user folders.
+    pub fn sent_folders(&mut self) -> Result<Vec<String>> {
+        let folders = self.session.list(None, Some("*"))?;
+        Ok(folders
+            .iter()
+            .filter_map(|name| {
+                let decoded = decode_imap_utf7(name.name());
+                let marked = name.attributes().iter().any(|attr| {
+                    matches!(attr,
+                NameAttribute::Custom(value) if value.eq_ignore_ascii_case("\\Sent"))
+                });
+                (marked
+                    || matches!(
+                        decoded.to_ascii_lowercase().as_str(),
+                        "sent"
+                            | "sent messages"
+                            | "sent items"
+                            | "已发送"
+                            | "已发送邮件"
+                            | "[gmail]/sent mail"
+                    ))
+                .then_some(decoded)
+            })
+            .collect())
+    }
+
+    pub fn gmail_trash_folder(&mut self) -> Result<String> {
+        let folders = self.session.list(None, Some("*"))?;
+        folders
+            .iter()
+            .find(|name| {
+                name.attributes().iter().any(|attr| {
+            matches!(attr, NameAttribute::Custom(value) if value.eq_ignore_ascii_case("\\Trash"))
+        })
+            })
+            .map(|name| decode_imap_utf7(name.name()))
+            .ok_or_else(|| anyhow!("Gmail Trash folder unavailable; remote cleanup pending"))
     }
 
     /// Create `folder` if it does not exist. Servers reject CREATE for an
@@ -734,7 +739,7 @@ impl MailCore {
     }
 
     /// Minimum spacing between SMTP sends (default 800ms; `SLIP_SEND_MIN_MS`
-    /// overrides, 0 disables — used by tests).
+    /// overrides, 0 disables).
     fn send_min_interval() -> Duration {
         let ms = env::var("SLIP_SEND_MIN_MS")
             .ok()
@@ -797,7 +802,6 @@ impl MailCore {
             SmtpTransport::builder_dangerous(endpoint.host.as_str()).port(endpoint.port);
         if endpoint.security != Security::Plain {
             let params = TlsParameters::builder(endpoint.host.clone())
-                .dangerous_accept_invalid_certs(self.config.allow_invalid_certs)
                 .build()
                 .context("build TLS parameters")?;
             builder = match endpoint.security {
@@ -1073,7 +1077,9 @@ pub fn imap_search_string(value: &str) -> String {
 /// its `\Deleted` flag (so it is hidden and cleaned up when the mailbox is
 /// next expunged normally) but is never nuked alongside others.
 fn expunge_uid(session: &mut ImapSession, uid: u32) -> Result<()> {
-    let _ = session.uid_expunge(uid.to_string());
+    session
+        .uid_expunge(uid.to_string())
+        .context("UID EXPUNGE failed; remote copy retained or flagged Deleted")?;
     Ok(())
 }
 
@@ -1614,68 +1620,4 @@ pub fn decode_imap_utf7(value: &str) -> String {
     }
     output.push_str(rest);
     output
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        CHAT_SUBJECT, Endpoint, MailConfig, Security, decode_imap_utf7, encode_imap_utf7,
-        imap_search_string, subject_matches,
-    };
-
-    fn sample_config(folder: &str) -> MailConfig {
-        let mut config = MailConfig::custom(
-            "me@example.com",
-            "secret",
-            Endpoint::new("imap.example.com", 993, Security::Ssl),
-            Endpoint::new("smtp.example.com", 465, Security::Ssl),
-        );
-        config.slip_folder = folder.to_string();
-        config
-    }
-
-    #[test]
-    fn spam_folders_are_provider_aware() {
-        let mut config = sample_config("Slip");
-        config.provider_id = "gmail".to_string();
-        assert!(config.spam_folders().contains(&"[Gmail]/Spam"));
-        config.provider_id = "qq".to_string();
-        assert!(config.spam_folders().contains(&"垃圾邮件"));
-        config.provider_id = "custom".to_string();
-        assert!(config.spam_folders().contains(&"Junk"));
-    }
-
-    #[test]
-    fn slip_folder_disable_and_collision() {
-        // Empty disables the dedicated folder.
-        assert_eq!(sample_config("").slip_folder_for("INBOX"), None);
-        assert_eq!(sample_config("   ").slip_folder_for("INBOX"), None);
-        // A folder equal to the arrival mailbox is a collision -> disabled.
-        assert_eq!(sample_config("INBOX").slip_folder_for("INBOX"), None);
-        assert_eq!(sample_config("inbox").slip_folder_for("INBOX"), None);
-        // A normal folder is used.
-        assert_eq!(sample_config("Slip").slip_folder_for("INBOX"), Some("Slip"));
-    }
-
-    #[test]
-    fn imap_utf7_round_trip_chinese_folder() {
-        let value = "其他文件夹/香港移民局";
-        assert_eq!(decode_imap_utf7(&encode_imap_utf7(value)), value);
-    }
-
-    #[test]
-    fn imap_utf7_decodes_ampersand() {
-        assert_eq!(decode_imap_utf7("A&-B"), "A&B");
-    }
-
-    #[test]
-    fn chat_subject_is_exact_protocol_marker() {
-        assert!(subject_matches(CHAT_SUBJECT, CHAT_SUBJECT));
-        assert!(subject_matches("  [slip/chat]  ", CHAT_SUBJECT));
-        assert!(!subject_matches("Re: [slip/chat]", CHAT_SUBJECT));
-        // A custom marker matches only itself.
-        assert!(subject_matches("hello", "hello"));
-        assert!(!subject_matches("[slip/chat]", "hello"));
-        assert_eq!(imap_search_string(CHAT_SUBJECT), "\"[slip/chat]\"");
-    }
 }

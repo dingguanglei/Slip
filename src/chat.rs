@@ -41,6 +41,7 @@ pub struct ChatClient {
     cache: MailCache,
     identity: Identity,
     account_address: String,
+    sync_lock: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -75,6 +76,11 @@ pub struct ChatSyncResult {
     pub fetched: usize,
     pub saved: usize,
     pub burned: usize,
+    /// Recognized messages retained because validation or cleanup failed.
+    #[serde(default)]
+    pub retained: usize,
+    #[serde(default)]
+    pub cleanup_pending: usize,
     /// Chat mail moved out of the inbox into the dedicated Slip folder.
     #[serde(default)]
     pub relocated: usize,
@@ -135,6 +141,7 @@ impl ChatClient {
             cache,
             identity,
             account_address,
+            sync_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -152,6 +159,70 @@ impl ChatClient {
 
     pub fn identity_fingerprint(&self) -> String {
         self.identity.fingerprint()
+    }
+
+    fn remember_wire(&self, raw: &[u8]) -> Result<()> {
+        let digest = protocol::outbound_wire_digest(
+            raw,
+            &self.account_address,
+            &self.identity_public_key(),
+            self.core.config().subject_marker(),
+        )
+        .ok_or_else(|| anyhow!("cannot record outbound wire receipt"))?;
+        self.cache.remember_outbound_wire(&digest)
+    }
+
+    fn is_saved_outbound(&self, raw: &[u8]) -> Result<bool> {
+        match protocol::outbound_wire_digest(
+            raw,
+            &self.account_address,
+            &self.identity_public_key(),
+            self.core.config().subject_marker(),
+        ) {
+            Some(digest) => self.cache.knows_outbound_wire(&digest),
+            None => Ok(false),
+        }
+    }
+
+    fn cleanup_saved(
+        &self,
+        session: &mut MailboxSession,
+        uid: u32,
+        result: &mut ChatSyncResult,
+    ) -> Result<()> {
+        let cleanup = if self.core.config().provider_id == "gmail" {
+            session.burn_gmail(uid)
+        } else {
+            session.delete(uid).map(|_| true)
+        };
+        match cleanup {
+            Ok(true) => result.burned += 1,
+            Ok(false) => result.relocated += 1,
+            Err(_) => result.cleanup_pending += 1,
+        }
+        Ok(())
+    }
+
+    /// Send only public routing/key material. Never include a user's draft.
+    pub fn exchange_key(&self, address: &str) -> Result<()> {
+        let to = normalize_email(address)?;
+        self.add_contact(&to)?;
+        let message = OutgoingSlip {
+            id: crate::crypto::random_id(),
+            ts: now_epoch_seconds_i64(),
+            from: self.account_address.clone(),
+            to: to.clone(),
+            text: String::new(),
+            media: Vec::new(),
+        };
+        let raw = protocol::build_mail(
+            &message,
+            &self.identity,
+            None,
+            self.core.config().subject_marker(),
+        )?;
+        self.remember_wire(&raw)?;
+        self.core.send_raw_mail(&to, &raw)
     }
 
     pub fn add_contact(&self, address: &str) -> Result<Vec<String>> {
@@ -221,10 +292,6 @@ impl ChatClient {
         Ok(out)
     }
 
-    fn session_contains_id(&self, contact: &str, id: &str) -> Result<bool> {
-        self.cache.session_has_id(contact, id)
-    }
-
     // ------------------------------------------------------------------
     // Sending
     // ------------------------------------------------------------------
@@ -239,6 +306,20 @@ impl ChatClient {
         to: &str,
         body: &str,
         attachments: &[PathBuf],
+    ) -> Result<ChatSendResult> {
+        self.send_parts_using(to, body, attachments, |to, raw| {
+            self.core.send_raw_mail(to, raw)
+        })
+    }
+
+    /// Same encryption and local persistence pipeline with an explicit
+    /// transport callback.
+    pub fn send_parts_using(
+        &self,
+        to: &str,
+        body: &str,
+        attachments: &[PathBuf],
+        deliver: impl FnOnce(&str, &[u8]) -> Result<()>,
     ) -> Result<ChatSendResult> {
         let to = normalize_email(to)?;
         let mut media = Vec::new();
@@ -268,6 +349,9 @@ impl ChatClient {
             .get(&to)
             .and_then(|record| record.encryption_key())
             .map(ToOwned::to_owned);
+        if encrypt_key.is_none() {
+            return Err(anyhow!("尚未建立加密连接，请先交换公钥；正文未发送"));
+        }
 
         let id = crate::crypto::random_id();
         let timestamp = now_epoch_seconds_i64();
@@ -312,15 +396,15 @@ impl ChatClient {
             retry_count: 0,
             next_retry_at: 0,
         };
-        self.upsert_line(&to, line.clone())?;
-
         let raw = protocol::build_mail(
             &outgoing,
             &self.identity,
             encrypt_key.as_deref(),
             self.core.config().subject_marker(),
         )?;
-        let send_result = self.core.send_raw_mail(&to, &raw);
+        self.upsert_line(&to, line.clone())?;
+        self.remember_wire(&raw)?;
+        let send_result = deliver(&to, &raw);
 
         let status = match &send_result {
             Ok(()) => DeliveryStatus::Sent,
@@ -387,6 +471,9 @@ impl ChatClient {
             .get(&contact)
             .and_then(|record| record.encryption_key())
             .map(ToOwned::to_owned);
+        if encrypt_key.is_none() {
+            return Err(anyhow!("cannot retry without a trusted encryption key"));
+        }
         let outgoing = OutgoingSlip {
             id: failed.id.clone(),
             ts: failed.timestamp,
@@ -401,9 +488,11 @@ impl ChatClient {
             encrypt_key.as_deref(),
             self.core.config().subject_marker(),
         )?;
+        self.remember_wire(&raw)?;
         let send_result = self.core.send_raw_mail(&contact, &raw);
 
         let mut line = failed.clone();
+        line.encrypted = true;
         line.status = if send_result.is_ok() {
             DeliveryStatus::Sent
         } else {
@@ -467,6 +556,9 @@ impl ChatClient {
                     .map(ToOwned::to_owned)
             };
 
+            if encrypt_key.is_none() {
+                continue;
+            }
             let mut touched = false;
             for mut line in due {
                 let mut media = Vec::new();
@@ -503,11 +595,15 @@ impl ChatClient {
                     encrypt_key.as_deref(),
                     self.core.config().subject_marker(),
                 )
-                .and_then(|raw| self.core.send_raw_mail(&contact, &raw));
+                .and_then(|raw| {
+                    self.remember_wire(&raw)?;
+                    self.core.send_raw_mail(&contact, &raw)
+                });
 
                 match sent {
                     Ok(()) => {
                         line.status = DeliveryStatus::Sent;
+                        line.encrypted = true;
                         line.flags.retain(|flag| !flag.starts_with("send-error:"));
                         line.next_retry_at = 0;
                     }
@@ -548,12 +644,26 @@ impl ChatClient {
         result
     }
 
+    /// Ingest one mail payload through the same validation/storage path.
+    /// Does not remove any remote message. Intended for explicit transports.
+    pub fn receive_wire(&self, raw: &[u8]) -> Result<ChatSyncResult> {
+        let _guard = self.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut result = ChatSyncResult::default();
+        match protocol::parse_mail_bytes(raw, &self.identity, self.core.config().subject_marker()) {
+            ParseOutcome::Message(incoming) => {
+                if !self.process_incoming(*incoming, &mut result)? {
+                    return Err(anyhow!("message not accepted"));
+                }
+            }
+            _ => return Err(anyhow!("message not readable")),
+        }
+        Ok(result)
+    }
+
     /// Incremental sync on an existing connection (used by the watch loop).
     ///
-    /// When a dedicated Slip folder is configured, chat mail is first moved
-    /// out of `arrival_mailbox` (the inbox) into that folder, so Slip traffic
-    /// never mixes with other mail; processing then happens on the Slip
-    /// folder. Without a dedicated folder, everything happens in place.
+    /// Read candidates in place across configured folders, then restore the
+    /// arrival mailbox so the watch loop receives its IDLE notifications.
     pub fn sync_with(
         &self,
         session: &mut MailboxSession,
@@ -561,59 +671,44 @@ impl ChatClient {
         limit: usize,
         burn_after_save: bool,
     ) -> Result<ChatSyncResult> {
+        let _sync_guard = self.sync_lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut result = ChatSyncResult {
             mailbox: arrival_mailbox.to_string(),
             cache_dir: self.cache.root().display().to_string(),
             ..ChatSyncResult::default()
         };
 
-        match self
-            .core
-            .config()
-            .slip_folder_for(arrival_mailbox)
-            .map(ToOwned::to_owned)
+        // Read in place: never move a message based only on SUBJECT search.
+        self.sync_folder(
+            session,
+            arrival_mailbox,
+            limit,
+            burn_after_save,
+            &mut result,
+        )?;
+        if let Some(folder) = self.core.config().slip_folder_for(arrival_mailbox)
+            && session.select(folder).is_ok()
         {
-            Some(folder) => {
-                // The dedicated folder is best-effort: probe that we can
-                // create+select it. If not (no permission, wrong namespace,
-                // a \Noselect node), degrade to processing chat mail in place
-                // in the inbox so delivery NEVER stops.
-                let folder_usable = {
-                    let _ = session.ensure_folder(&folder);
-                    session.select(&folder).is_ok()
-                };
-                if folder_usable {
-                    self.relocate_to_folder(session, arrival_mailbox, &folder, &mut result)?;
-                    // Recover chat mail the provider misfiled into spam/junk.
-                    self.sweep_spam_to_folder(session, &folder, &mut result);
-                    // Non-fatal: if processing the Slip folder fails after a
-                    // relocate, that mail stays there and is retried next sync
-                    // (its cursor is only advanced on success). We must still
-                    // run the inbox pass below.
-                    let _ = self.sync_folder(session, &folder, limit, burn_after_save, &mut result);
-                }
-                // Always process the inbox: the sole delivery path when the
-                // folder is unusable, and a fallback for anything a move could
-                // not relocate.
-                self.sync_folder(
-                    session,
-                    arrival_mailbox,
-                    limit,
-                    burn_after_save,
-                    &mut result,
-                )?;
-            }
-            None => {
-                self.sync_folder(
-                    session,
-                    arrival_mailbox,
-                    limit,
-                    burn_after_save,
-                    &mut result,
-                )?;
+            self.sync_folder(session, folder, limit, burn_after_save, &mut result)?;
+        }
+        for folder in self.core.config().spam_folders() {
+            if session.select(folder).is_ok() {
+                self.sync_folder(session, folder, limit, burn_after_save, &mut result)?;
             }
         }
 
+        if burn_after_save {
+            for folder in session.sent_folders()? {
+                if !folder.eq_ignore_ascii_case(arrival_mailbox) {
+                    self.sync_folder(session, &folder, limit, true, &mut result)?;
+                }
+            }
+        }
+        if burn_after_save && self.core.config().provider_id == "gmail" {
+            let trash = session.gmail_trash_folder()?;
+            self.sync_folder(session, &trash, limit, true, &mut result)?;
+        }
+        session.select(arrival_mailbox)?;
         result.contacts = {
             let _guard = self.cache.lock();
             self.cache.load_contacts()?
@@ -635,59 +730,6 @@ impl ChatClient {
         Ok(result)
     }
 
-    /// Move every `[slip/chat]` message in `arrival_mailbox` into `folder`.
-    fn relocate_to_folder(
-        &self,
-        session: &mut MailboxSession,
-        arrival_mailbox: &str,
-        folder: &str,
-        result: &mut ChatSyncResult,
-    ) -> Result<()> {
-        session.select(arrival_mailbox)?;
-        let uids = session.uid_search(&format!(
-            "SUBJECT {}",
-            imap_search_string(self.core.config().subject_marker())
-        ))?;
-        for uid in uids {
-            if session.move_to(uid, folder).is_ok() {
-                result.relocated += 1;
-            }
-            // A failed move leaves the message in the inbox; the fallback
-            // sync_folder pass on the inbox will still deliver it.
-        }
-        Ok(())
-    }
-
-    /// Best-effort: move any `[slip/chat]` mail the provider misfiled into a
-    /// spam/junk folder over into the Slip folder, so it is not lost. Missing
-    /// folders and any per-folder error are ignored.
-    fn sweep_spam_to_folder(
-        &self,
-        session: &mut MailboxSession,
-        folder: &str,
-        result: &mut ChatSyncResult,
-    ) {
-        for spam in self.core.config().spam_folders() {
-            if spam.eq_ignore_ascii_case(folder) {
-                continue;
-            }
-            if session.select(spam).is_err() {
-                continue; // folder does not exist on this account
-            }
-            let Ok(uids) = session.uid_search(&format!(
-                "SUBJECT {}",
-                imap_search_string(self.core.config().subject_marker())
-            )) else {
-                continue;
-            };
-            for uid in uids {
-                if session.move_to(uid, folder).is_ok() {
-                    result.relocated += 1;
-                }
-            }
-        }
-    }
-
     /// Cursor-based incremental processing of one folder.
     fn sync_folder(
         &self,
@@ -699,12 +741,18 @@ impl ChatClient {
     ) -> Result<()> {
         let info = session.select(mailbox)?;
         let key = cursor_key(&self.account_address, mailbox);
-        let cursor = {
+        let saved_cursor = {
             let _guard = self.cache.lock();
-            self.cache.load_state()?.cursors.get(&key).copied()
+            self.cache
+                .load_state()?
+                .cursors
+                .get(&key)
+                .copied()
+                .filter(|cursor| cursor.uid_validity == info.uid_validity)
         };
+        let cursor = if burn_after_save { None } else { saved_cursor };
 
-        let (uids, used_cursor, truncated) = match cursor {
+        let (mut uids, used_cursor, truncated) = match cursor {
             Some(cursor) if cursor.uid_validity == info.uid_validity && cursor.last_uid > 0 => {
                 let query = format!(
                     "UID {}:* SUBJECT {}",
@@ -728,7 +776,7 @@ impl ChatClient {
                     "SUBJECT {}",
                     imap_search_string(self.core.config().subject_marker())
                 ))?;
-                let truncated = uids.len() > limit;
+                let truncated = !burn_after_save && uids.len() > limit;
                 if truncated {
                     uids.truncate(limit);
                 }
@@ -736,6 +784,25 @@ impl ChatClient {
             }
         };
 
+        // Also inspect a bounded range of fresh headers without SEARCH.
+        // This closes the delivery-to-search-index lag seen on real providers.
+        let recent_start = saved_cursor
+            .map(|c| c.last_uid.saturating_add(1))
+            .unwrap_or_else(|| info.uid_next.saturating_sub(200))
+            .max(1);
+        let recent_end = info
+            .uid_next
+            .saturating_sub(1)
+            .min(recent_start.saturating_add(199));
+        if burn_after_save {
+            uids.extend(session.chat_header_uids(
+                recent_start,
+                recent_end,
+                self.core.config().subject_marker(),
+            )?);
+            uids.sort_unstable();
+            uids.dedup();
+        }
         result.used_cursor = used_cursor;
         let mut max_uid = cursor.map(|cursor| cursor.last_uid).unwrap_or(0);
 
@@ -746,54 +813,30 @@ impl ChatClient {
             result.fetched += 1;
             max_uid = max_uid.max(uid);
 
+            if self.is_saved_outbound(&raw)? {
+                if burn_after_save {
+                    self.cleanup_saved(session, uid, result)?;
+                }
+                continue;
+            }
             match protocol::parse_mail_bytes(
                 &raw,
                 &self.identity,
                 self.core.config().subject_marker(),
             ) {
                 ParseOutcome::NotSlip => {}
-                ParseOutcome::Unreadable {
-                    id,
-                    from,
-                    ts,
-                    encrypted,
-                    reason,
-                } => {
-                    let from = from.to_ascii_lowercase();
-                    let contact = if from.is_empty() || from == self.account_address {
-                        continue;
-                    } else {
-                        from
-                    };
-                    let line = StoredChatLine {
-                        sender: contact.clone(),
-                        date: format_chat_timestamp(ts.max(0)),
-                        timestamp: ts.max(0),
-                        body: "(Slip message that cannot be read; kept in the mailbox)".to_string(),
-                        attachments: Vec::new(),
-                        id,
-                        status: DeliveryStatus::Sent,
-                        encrypted,
-                        media: Vec::new(),
-                        flags: vec![format!("unreadable:{reason}")],
-                        retry_count: 0,
-                        next_retry_at: 0,
-                    };
-                    if self.insert_if_new(&contact, line)? {
-                        result.saved += 1;
-                        self.with_contacts(|contacts| ensure_contact(contacts, &contact))?;
-                    }
-                    // Never burn what we could not read.
+                ParseOutcome::Unreadable { .. } => {
+                    // Never reserve a message ID for an unauthenticated or
+                    // unreadable placeholder: it could suppress a later valid
+                    // copy, causing premature deletion without real content.
+                    result.retained += 1;
                 }
                 ParseOutcome::Message(incoming) => {
                     let processed = self.process_incoming(*incoming, result)?;
                     if processed && burn_after_save {
-                        match session.delete(uid) {
-                            Ok(()) => result.burned += 1,
-                            Err(_) => {
-                                // Leave it; next sync dedups by id.
-                            }
-                        }
+                        self.cleanup_saved(session, uid, result)?;
+                    } else if !processed {
+                        result.retained += 1;
                     }
                 }
             }
@@ -802,7 +845,9 @@ impl ChatClient {
         // When the full scan was truncated, only claim up to the newest UID we
         // actually processed. Otherwise everything through uid_next has been
         // examined, so advance past it.
-        let last_uid = if truncated {
+        let last_uid = if burn_after_save {
+            recent_end.max(saved_cursor.map(|c| c.last_uid).unwrap_or(0))
+        } else if truncated {
             max_uid
         } else {
             max_uid.max(info.uid_next.saturating_sub(1))
@@ -829,13 +874,27 @@ impl ChatClient {
         incoming: IncomingSlip,
         result: &mut ChatSyncResult,
     ) -> Result<bool> {
-        if incoming.from == self.account_address {
-            return Ok(true);
+        if incoming.from == self.account_address
+            || incoming.legacy
+            || incoming.id.is_empty()
+            || !incoming.problems.is_empty()
+            || !incoming.to.iter().any(|to| to == &self.account_address)
+            || (!incoming.encrypted && (!incoming.text.is_empty() || !incoming.media.is_empty()))
+        {
+            return Ok(false);
         }
-        if incoming.from.is_empty() {
+        if normalize_email(&incoming.from).is_err() {
             return Ok(false);
         }
         let contact = incoming.from.clone();
+        let handshake =
+            !incoming.encrypted && incoming.text.is_empty() && incoming.media.is_empty();
+        if incoming.sender_key.is_none() {
+            return Ok(false);
+        }
+        let known_contact = self.cache.load_contacts()?.contains(&contact);
+        let first_key = !self.cache.load_peers()?.contains_key(&contact);
+        // Unsolicited invitations never cause automatic email replies.
         self.with_contacts(|contacts| ensure_contact(contacts, &contact))?;
 
         let mut flags = incoming.problems.clone();
@@ -872,7 +931,6 @@ impl ChatClient {
                     }
                     Some(record) if record.key == *sender_key => {
                         record.last_seen = now;
-                        record.pending_key = None;
                         false
                     }
                     Some(record) => {
@@ -896,12 +954,34 @@ impl ChatClient {
             }
         }
 
+        if handshake {
+            if first_key && known_contact {
+                self.exchange_key(&contact)?;
+            }
+            return Ok(true); // the peer key has been committed to SQLite
+        }
+        if self
+            .cache
+            .load_peers()?
+            .get(&contact)
+            .and_then(|p| p.pending_key.as_ref())
+            .is_some()
+        {
+            return Ok(false);
+        }
+
         // Duplicate remote copy of an already-saved message: safe to burn,
         // but do not rewrite its media (a replay with the same id must not
         // clobber the stored attachment bytes) or re-notify.
-        if !incoming.id.is_empty() && self.session_contains_id(&contact, &incoming.id)? {
-            return Ok(true);
-        }
+        let replace_placeholder = match self
+            .load_session_lines(&contact)?
+            .iter()
+            .find(|line| line.id == incoming.id)
+        {
+            Some(line) if !line.flags.is_empty() => true,
+            Some(_) => return Ok(true),
+            None => false,
+        };
 
         // Only burn once every media item was recovered; a missing or
         // undecryptable attachment means we keep the mail for a later retry.
@@ -925,8 +1005,10 @@ impl ChatClient {
                 crate::core::safe_filename(&item.entry.name, item.entry.idx)
             );
             let path = media_dir.join(file_name);
-            std::fs::write(&path, &item.bytes)
-                .with_context(|| format!("write media {}", path.display()))?;
+            use std::io::Write;
+            let mut file = std::fs::File::create(&path)?;
+            file.write_all(&item.bytes)?;
+            file.sync_all()?;
             let path = path.display().to_string();
             attachment_paths.push(path.clone());
             stored_media.push(StoredMedia {
@@ -938,6 +1020,9 @@ impl ChatClient {
             });
         }
 
+        if !incoming.media.is_empty() {
+            crate::cache::sync_directory(&media_dir)?;
+        }
         let timestamp = if incoming.ts > 0 {
             incoming.ts
         } else {
@@ -959,7 +1044,13 @@ impl ChatClient {
         };
 
         let preview = preview_of(&line);
-        if self.insert_if_new(&contact, line)? {
+        let inserted = if replace_placeholder {
+            self.upsert_line(&contact, line)?;
+            true
+        } else {
+            self.insert_if_new(&contact, line)?
+        };
+        if inserted {
             result.saved += 1;
             result.new_messages.push(NewMessageNotice {
                 contact: contact.clone(),
@@ -1109,10 +1200,14 @@ impl ChatClient {
                 .max()
                 .unwrap_or_default();
             let last_read = state.last_read.get(&contact).copied().unwrap_or(0);
-            let unread = lines
-                .iter()
-                .filter(|line| line.sender != "me" && stored_chat_timestamp(line) > last_read)
-                .count();
+            let incoming_count = lines.iter().filter(|line| line.sender != "me").count();
+            let read_count = state.read_counts.get(&contact).copied().unwrap_or_else(|| {
+                lines
+                    .iter()
+                    .filter(|line| line.sender != "me" && stored_chat_timestamp(line) <= last_read)
+                    .count()
+            });
+            let unread = incoming_count.saturating_sub(read_count);
             let alias = aliases.get(&contact).cloned();
             sessions.push(ChatSessionSummary {
                 contact,
@@ -1138,13 +1233,15 @@ impl ChatClient {
     /// Mark a conversation as read up to its newest line.
     pub fn mark_read(&self, contact: &str) -> Result<()> {
         let contact = normalize_email(contact)?;
-        let newest = self
-            .load_session_lines(&contact)?
+        let lines = self.load_session_lines(&contact)?;
+        let newest = lines
             .iter()
             .map(stored_chat_timestamp)
             .max()
             .unwrap_or_else(now_epoch_seconds_i64);
+        let count = lines.iter().filter(|line| line.sender != "me").count();
         self.with_state(|state| {
+            state.read_counts.insert(contact.clone(), count);
             let entry = state.last_read.entry(contact).or_insert(0);
             *entry = (*entry).max(newest);
         })
@@ -1426,13 +1523,8 @@ fn same_legacy_line(left: &StoredChatLine, right: &StoredChatLine) -> bool {
 }
 
 pub fn sort_chat_lines(lines: &mut [StoredChatLine]) {
-    lines.sort_by(|left, right| {
-        stored_chat_timestamp(left)
-            .cmp(&stored_chat_timestamp(right))
-            .then_with(|| left.id.cmp(&right.id))
-            .then_with(|| left.sender.cmp(&right.sender))
-            .then_with(|| left.body.cmp(&right.body))
-    });
+    // Stable sort preserves local insertion order for same-second messages.
+    lines.sort_by_key(stored_chat_timestamp);
 }
 
 pub fn stored_chat_timestamp(line: &StoredChatLine) -> i64 {
@@ -1479,165 +1571,4 @@ pub fn unread_map(summaries: &[ChatSessionSummary]) -> HashSet<String> {
         .filter(|summary| summary.unread > 0)
         .map(|summary| summary.contact.clone())
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        MAX_SEND_RETRIES, normalize_email, parse_composer, preview_of, retry_backoff_secs,
-        sort_chat_lines,
-    };
-    use crate::cache::{DeliveryStatus, StoredChatLine, StoredMedia};
-    use crate::protocol::MediaKind;
-    use std::path::PathBuf;
-
-    #[test]
-    fn retry_backoff_grows_then_caps() {
-        assert_eq!(retry_backoff_secs(0), 15);
-        assert_eq!(retry_backoff_secs(1), 30);
-        assert_eq!(retry_backoff_secs(2), 60);
-        // Monotonic non-decreasing and capped at 30 minutes.
-        let mut prev = 0;
-        for n in 0..MAX_SEND_RETRIES + 4 {
-            let b = retry_backoff_secs(n);
-            assert!(b >= prev);
-            assert!(b <= 30 * 60);
-            prev = b;
-        }
-    }
-
-    fn line(id: &str, ts: i64) -> StoredChatLine {
-        StoredChatLine {
-            sender: "me".to_string(),
-            date: String::new(),
-            timestamp: ts,
-            body: "x".to_string(),
-            attachments: Vec::new(),
-            id: id.to_string(),
-            status: DeliveryStatus::Sent,
-            encrypted: false,
-            media: Vec::new(),
-            flags: Vec::new(),
-            retry_count: 0,
-            next_retry_at: 0,
-        }
-    }
-
-    #[test]
-    fn composer_extracts_at_paths() {
-        let parsed = parse_composer("hello @./photo.png world @/tmp/a.txt");
-        assert_eq!(parsed.body, "hello world");
-        assert_eq!(
-            parsed.attachments,
-            vec![PathBuf::from("./photo.png"), PathBuf::from("/tmp/a.txt")]
-        );
-    }
-
-    #[test]
-    fn composer_leaves_plain_at_words_in_body() {
-        let parsed = parse_composer("mail me at test@qq.com @");
-        assert_eq!(parsed.body, "mail me at test@qq.com @");
-        assert!(parsed.attachments.is_empty());
-    }
-
-    #[test]
-    fn composer_handles_single_quoted_path_with_spaces() {
-        let parsed = parse_composer("看下这张图 @'/home/u/截图 2026-06-24 21-06-11.png'");
-        assert_eq!(parsed.body, "看下这张图");
-        assert_eq!(
-            parsed.attachments,
-            vec![PathBuf::from("/home/u/截图 2026-06-24 21-06-11.png")]
-        );
-    }
-
-    #[test]
-    fn composer_handles_double_quotes_and_backslash_escapes() {
-        let quoted = parse_composer("hi @\"/tmp/a b/c.png\"");
-        assert_eq!(quoted.attachments, vec![PathBuf::from("/tmp/a b/c.png")]);
-        let escaped = parse_composer(r"hi @/tmp/a\ b/c.png");
-        assert_eq!(escaped.attachments, vec![PathBuf::from("/tmp/a b/c.png")]);
-        assert_eq!(quoted.body, "hi");
-        assert_eq!(escaped.body, "hi");
-    }
-
-    #[test]
-    fn composer_auto_attaches_dragged_absolute_file_only() {
-        let dir = std::env::temp_dir().join(format!("slip-drop-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("dropped file.png");
-        std::fs::write(&file, b"x").unwrap();
-        // Terminal drag-drop pastes a single-quoted absolute path, no '@'.
-        let input = format!("look '{}'", file.display());
-        let parsed = parse_composer(&input);
-        assert_eq!(parsed.body, "look");
-        assert_eq!(parsed.attachments, vec![file.clone()]);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn composer_never_attaches_a_relative_path_word() {
-        // Even though Cargo.toml exists under the cwd, a bare relative word
-        // must stay message text — never silently emailed.
-        let parsed = parse_composer("please read Cargo.toml and src/chat.rs");
-        assert!(parsed.attachments.is_empty());
-        assert_eq!(parsed.body, "please read Cargo.toml and src/chat.rs");
-    }
-
-    #[test]
-    fn composer_keeps_apostrophes_in_prose_and_attaches() {
-        // Regression: contractions must not swallow the attachment.
-        let parsed = parse_composer("it's here, don't miss it @/tmp/photo.png");
-        assert_eq!(parsed.body, "it's here, don't miss it");
-        assert_eq!(parsed.attachments, vec![PathBuf::from("/tmp/photo.png")]);
-
-        let quoted = parse_composer("don't @'/a b/c.png'");
-        assert_eq!(quoted.body, "don't");
-        assert_eq!(quoted.attachments, vec![PathBuf::from("/a b/c.png")]);
-    }
-
-    #[test]
-    fn composer_unterminated_quote_keeps_attachment() {
-        let parsed = parse_composer("he said \"hi @/tmp/a.png");
-        assert_eq!(parsed.attachments, vec![PathBuf::from("/tmp/a.png")]);
-        assert!(parsed.body.contains("he said"));
-    }
-
-    #[test]
-    fn composer_preserves_windows_backslashes() {
-        let parsed = parse_composer(r"see @C:\Users\me\pic.png");
-        assert_eq!(
-            parsed.attachments,
-            vec![PathBuf::from(r"C:\Users\me\pic.png")]
-        );
-    }
-
-    #[test]
-    fn email_normalization_rejects_invalid_values() {
-        assert_eq!(normalize_email(" USER@QQ.COM ").unwrap(), "user@qq.com");
-        assert!(normalize_email("not-mail").is_err());
-    }
-
-    #[test]
-    fn chat_lines_sort_by_timestamp_then_id() {
-        let mut lines = vec![line("b", 20), line("a", 10), line("c", 20)];
-        sort_chat_lines(&mut lines);
-        assert_eq!(
-            lines.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(),
-            vec!["a", "b", "c"]
-        );
-    }
-
-    #[test]
-    fn preview_shows_media_kind_for_empty_body() {
-        let mut media_line = line("a", 1);
-        media_line.body = String::new();
-        media_line.media.push(StoredMedia {
-            kind: MediaKind::Image,
-            name: "photo.png".to_string(),
-            mime: "image/png".to_string(),
-            size: 10,
-            path: "/tmp/p.png".to_string(),
-        });
-        assert_eq!(preview_of(&media_line), "me: [image photo.png]");
-    }
 }

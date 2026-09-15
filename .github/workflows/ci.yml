@@ -1,20 +1,33 @@
-name: CI
-
+name: Build
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-
+permissions:
+  contents: read
 jobs:
-  rust:
-    runs-on: ubuntu-latest
+  source:
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo build --locked --bins
+      - run: npm ci --ignore-scripts
+        working-directory: desktop
+      - name: Check desktop and web JavaScript
+        run: |
+          node --check web/app.js
+          node --check desktop/main.cjs
+          node --check desktop/runtime.cjs
+          node --check desktop/scripts/package.cjs

@@ -61,12 +61,11 @@ pub enum Event {
 }
 
 /// Whether to delete Slip mail from the server after saving it locally.
-/// Default false: chat mail is archived in the dedicated Slip folder rather
-/// than deleted. `SLIP_BURN=1` gives zero remote footprint.
+/// Enabled by default; Web/Desktop enforce cleanup independently of this setting.
 pub fn burn_remote() -> bool {
     std::env::var("SLIP_BURN")
         .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// Owns the worker and watcher threads and the command/event channels.
@@ -82,6 +81,11 @@ impl Engine {
     /// Start the background threads for `client`, watching `mailbox` (the
     /// arrival inbox). Returns immediately; work happens on the threads.
     pub fn start(client: ChatClient, mailbox: String) -> Self {
+        Self::start_with_cleanup(client, mailbox, burn_remote())
+    }
+
+    /// Explicit policy for frontends such as Web, where cleanup is required.
+    pub fn start_with_cleanup(client: ChatClient, mailbox: String, burn: bool) -> Self {
         let (command_tx, command_rx) = channel::<Command>();
         let (event_tx, event_rx) = channel::<Event>();
         let stop = Arc::new(AtomicBool::new(false));
@@ -91,8 +95,9 @@ impl Engine {
             mailbox.clone(),
             command_rx,
             event_tx.clone(),
+            burn,
         );
-        let watcher = spawn_watcher(client, mailbox, stop.clone(), event_tx);
+        let watcher = spawn_watcher(client, mailbox, stop.clone(), event_tx, burn);
 
         Self {
             commands: command_tx,
@@ -142,16 +147,21 @@ fn spawn_worker(
     mailbox: String,
     commands: Receiver<Command>,
     events: Sender<Event>,
+    burn: bool,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         // First catch-up sync so the frontend has data before IDLE reports.
-        run_sync(&client, &mailbox, &events);
+        run_sync(&client, &mailbox, &events, burn);
         // Block for commands, but wake periodically to run the resend queue.
         loop {
             let command = match commands.recv_timeout(RETRY_TICK) {
                 Ok(command) => command,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     run_retry(&client, &events);
+                    // Sent-folder copies and failed cleanup may not wake INBOX IDLE.
+                    if burn {
+                        run_sync(&client, &mailbox, &events, burn);
+                    }
                     continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -182,7 +192,7 @@ fn spawn_worker(
                     let _ = events.send(Event::SessionUpdated(to));
                     send_sessions(&client, &events);
                 }
-                Command::Sync => run_sync(&client, &mailbox, &events),
+                Command::Sync => run_sync(&client, &mailbox, &events, burn),
                 Command::AddContact(address) => {
                     let _ = client.add_contact(&address);
                     send_sessions(&client, &events);
@@ -258,13 +268,14 @@ fn spawn_watcher(
     mailbox: String,
     stop: Arc<AtomicBool>,
     events: Sender<Event>,
+    burn: bool,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let sync_events = events.clone();
         let sessions_client = client.clone();
         client.watch(
             &mailbox,
-            burn_remote(),
+            burn,
             POLL_FALLBACK,
             &stop,
             move |result| {
@@ -277,6 +288,7 @@ fn spawn_watcher(
                 for notice in &result.new_messages {
                     let _ = sync_events.send(Event::SessionUpdated(notice.contact.clone()));
                 }
+                let _ = sync_events.send(Event::Status(sync_status(result)));
                 send_sessions(&sessions_client, &sync_events);
             },
             move |status| {
@@ -287,9 +299,10 @@ fn spawn_watcher(
     })
 }
 
-fn run_sync(client: &ChatClient, mailbox: &str, events: &Sender<Event>) {
-    match client.sync(mailbox, SYNC_LIMIT, burn_remote()) {
+fn run_sync(client: &ChatClient, mailbox: &str, events: &Sender<Event>, burn: bool) {
+    match client.sync(mailbox, SYNC_LIMIT, burn) {
         Ok(result) => {
+            let _ = events.send(Event::Status(sync_status(&result)));
             if !result.new_messages.is_empty() {
                 let _ = events.send(Event::Notices(result.new_messages.clone()));
             }
@@ -311,4 +324,11 @@ fn send_sessions(client: &ChatClient, events: &Sender<Event>) {
     if let Ok(sessions) = client.sessions() {
         let _ = events.send(Event::Sessions(sessions));
     }
+}
+
+fn sync_status(result: &crate::chat::ChatSyncResult) -> String {
+    format!(
+        "已保存 {} 条 · 已清理 {} 封 · 验证保留 {} 封 · 清理待重试 {} 封",
+        result.saved, result.burned, result.retained, result.cleanup_pending
+    )
 }

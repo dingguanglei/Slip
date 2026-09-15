@@ -1,5 +1,12 @@
 # Slip Wire Protocol v1
 
+> Current application policy: v1 text and attachments MUST be encrypted. The
+> only plaintext send is an empty envelope with no media for public-key
+> exchange. The legacy/plaintext layouts below document decoding compatibility,
+> not permission to transmit user content. Web rejects legacy content for
+> ingestion/cleanup and always enables validated save-before-delete.
+
+
 Slip turns ordinary mailboxes into chat endpoints. Every Slip message is a
 standard RFC 5322 email, so it survives any SMTP/IMAP provider and degrades
 gracefully in a normal mail client. This document is the canonical
@@ -124,9 +131,9 @@ multipart/mixed
 - On the first message from a contact, the receiver records the key in
   `~/.slip/slip.db` (TOFU peers) with `fingerprint = hex(SHA-256(pubkey))[..16]`.
 - Once a peer key is known, outgoing messages to that contact are encrypted
-  by default (per-contact opt-out).
+  without a plaintext fallback. Disabled or pending keys block sends.
 - If a message arrives under a **different** key for a known contact, the
-  message is still shown but flagged, the UI raises a key-change warning, and
+  message stays remote, the UI raises a key-change warning, and
   encryption to that contact is suspended until the user re-trusts the new
   key (`/trust`).
 - Fingerprints are displayed (`/info`) for out-of-band verification.
@@ -137,8 +144,7 @@ multipart/mixed
   passive interceptors, once keys are exchanged; sender authenticity between
   established peers.
 - **Does not protect:** metadata (addresses, timing, approximate sizes, the
-  `[slip/chat]` marker) — inherent to email; the very first inbound message
-  from an unknown peer (TOFU window); against an active MITM who substitutes
+  `[slip/chat]` marker) — inherent to email; against an active MITM who substitutes
   keys during first contact (mitigate by comparing fingerprints out-of-band).
 - **No forward secrecy in v1** (static-static). Compromise of an identity key
   exposes past traffic that the attacker archived. Roadmap: ratcheting.
@@ -158,9 +164,12 @@ multipart/mixed
 - Incremental fetch: `UID SEARCH UID <last_uid+1>:* SUBJECT "[slip/chat]"`,
   then `UID FETCH` of the matches only.
 - If `UIDVALIDITY` changes, the cursor resets and a bounded rescan runs.
-- **Burn-after-save** (default): once a message and its media are persisted
-  locally, the remote mail is deleted — the mailbox is transport, the local
-  store is truth. `--keep-remote` opts out.
+- **Burn-after-save**: Web always enables cleanup. Debug CLI uses `--burn`.
+  Once a validated message and media are durably stored, its remote UID is
+  removed. Cleanup mode rescans candidates so failures are retried.
+- Only exact outbound MIME digests recorded locally authorize sent-copy cleanup.
+  Gmail copies go through special-use Trash before targeted UID EXPUNGE.
+- `BODY.PEEK[]` avoids changing read flags. Never issue an unqualified EXPUNGE.
 - Local persistence always precedes remote deletion; a failed burn is retried
   on the next sync and deduplicated by id.
 
@@ -184,16 +193,7 @@ Most providers cap raw mail size (Gmail ≈ 25 MB, QQ ≈ 50 MB) and base64 adds
 
 ## Compatibility
 
-- **v0 (legacy):** subject matches but no `X-Slip-Version`. Parsed as: body
-  text = the plain-text part, every attachment = `kind: file`. Never
-  encrypted. Slip keeps reading these forever.
-- **Future versions:** a receiver seeing `X-Slip-Version` greater than it
-  understands shows the `text/plain` fallback plus an upgrade hint, and never
-  burns mail it cannot fully parse.
-
-## Test vectors
-
-`tests/protocol.rs` pins: envelope round-trip (build → RFC 5322 bytes →
-parse), media classification, id dedup, an encrypted round-trip with fixed
-keys, nonce-prefix layout, and key-change detection. Keep fixtures small
-enough to audit by eye.
+The parser can recognize legacy envelopes, but the chat client only accepts
+fully validated v1 messages for local chat delivery and remote cleanup.
+Legacy or future versions are retained on the mail server; recognizing a
+matching subject is never permission to delete a message.

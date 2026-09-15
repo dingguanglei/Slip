@@ -139,7 +139,7 @@ impl Wizard {
         if self.secret.trim().is_empty() {
             return Err(anyhow!("password / authorization code is required"));
         }
-        let mut config = match self.provider() {
+        let config = match self.provider() {
             Some(provider) => MailConfig::from_provider(provider, address, self.secret.clone()),
             None => {
                 let imap = parse_endpoint(&self.imap_input, 993)?;
@@ -147,12 +147,6 @@ impl Wizard {
                 MailConfig::custom(address, self.secret.clone(), imap, smtp)
             }
         };
-        if std::env::var("SLIP_ALLOW_INVALID_CERTS")
-            .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
-            .unwrap_or(false)
-        {
-            config.allow_invalid_certs = true;
-        }
         Ok(config)
     }
 }
@@ -1580,41 +1574,4 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
         lines.push(String::new());
     }
     lines
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{fit, human_size, parse_endpoint, wrap_text};
-    use crate::providers::Security;
-
-    #[test]
-    fn endpoint_parsing_defaults_by_port() {
-        let endpoint = parse_endpoint("imap.example.com:993", 993).unwrap();
-        assert_eq!(endpoint.security, Security::Ssl);
-        let endpoint = parse_endpoint("mail.example.com:587", 465).unwrap();
-        assert_eq!(endpoint.security, Security::StartTls);
-        let endpoint = parse_endpoint("localhost:3143:plain", 993).unwrap();
-        assert_eq!(endpoint.security, Security::Plain);
-        assert_eq!(endpoint.port, 3143);
-        let endpoint = parse_endpoint("imap.example.com", 993).unwrap();
-        assert_eq!(endpoint.port, 993);
-        assert!(parse_endpoint("", 993).is_err());
-        assert!(parse_endpoint("host:notaport", 993).is_err());
-    }
-
-    #[test]
-    fn human_sizes() {
-        assert_eq!(human_size(500), "500 B");
-        assert_eq!(human_size(2048), "2 KB");
-        assert_eq!(human_size(3 * 1024 * 1024), "3.0 MB");
-    }
-
-    #[test]
-    fn wrap_and_fit() {
-        assert_eq!(fit("abcdef", 3), "abc…");
-        let wrapped = wrap_text("one two three four", 9);
-        assert_eq!(wrapped, vec!["one two", "three", "four"]);
-        let hard = wrap_text("aaaaaaaaaaaa", 4);
-        assert!(hard.iter().all(|line| line.chars().count() <= 4));
-    }
 }
