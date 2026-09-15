@@ -696,6 +696,14 @@ impl MailCache {
         self.put_kv("peers", peers)
     }
 
+    pub fn load_requests(&self) -> Result<HashMap<String, KeyRequest>> {
+        Ok(self.get_kv("key_requests")?.unwrap_or_default())
+    }
+
+    pub fn save_requests(&self, requests: &HashMap<String, KeyRequest>) -> Result<()> {
+        self.put_kv("key_requests", requests)
+    }
+
     /// Directory for the media of one received message.
     pub fn incoming_media_dir(&self, contact: &str, message_id: &str) -> PathBuf {
         let id = if message_id.is_empty() {
@@ -765,6 +773,33 @@ pub struct SyncCursor {
 
 pub fn cursor_key(account: &str, mailbox: &str) -> String {
     format!("{}|{}", account.to_ascii_lowercase(), mailbox)
+}
+
+/// Durable public-key invitation and SMTP outbox. No message content.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct KeyRequest {
+    pub accepted: bool,
+    pub received: bool,
+    pub sent: bool,
+    pub wire: Vec<u8>,
+    pub attempts: u32,
+    pub next_attempt: i64,
+    pub updated_at: i64,
+}
+
+impl KeyRequest {
+    pub fn status(&self) -> &'static str {
+        if !self.accepted {
+            "incoming"
+        } else if !self.wire.is_empty() {
+            "queued"
+        } else if self.received && self.sent {
+            "ready"
+        } else {
+            "waiting"
+        }
+    }
 }
 
 /// peers.json: TOFU key records keyed by contact address.

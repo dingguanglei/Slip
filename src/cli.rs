@@ -323,8 +323,12 @@ pub fn run() -> Result<()> {
             }))
         }
         Command::ChatExchange { email } => {
-            chat_client(core)?.exchange_key(&email)?;
-            print_json(&serde_json::json!({"ok":true}))
+            let client = chat_client(core)?;
+            client.exchange_key(&email)?;
+            client.retry_key_requests()?;
+            print_json(
+                &serde_json::json!({"ok":true,"request":client.contact_info(&email)?.request_status}),
+            )
         }
         Command::ChatName { email, name } => {
             let client = chat_client(core)?;

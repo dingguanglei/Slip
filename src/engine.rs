@@ -13,12 +13,12 @@ use std::sync::{
     mpsc::{Receiver, Sender, channel},
 };
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const POLL_FALLBACK: Duration = Duration::from_secs(15);
 const SYNC_LIMIT: usize = 200;
 /// How often the worker wakes to run the automatic resend queue.
-const RETRY_TICK: Duration = Duration::from_secs(20);
+const RETRY_TICK: Duration = Duration::from_secs(5);
 
 /// A request from the frontend to the engine.
 #[derive(Clone, Debug)]
@@ -31,7 +31,9 @@ pub enum Command {
     },
     /// Run an incremental sync now.
     Sync,
-    /// Add a contact to the address book.
+    /// Deliver durable public-key invitations.
+    FlushRequests,
+    /// Invite or accept a contact by email.
     AddContact(String),
     /// Accept a contact's changed identity key.
     Trust(String),
@@ -150,20 +152,19 @@ fn spawn_worker(
     burn: bool,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
-        // First catch-up sync so the frontend has data before IDLE reports.
-        run_sync(&client, &mailbox, &events, burn);
+        // The watcher owns initial catch-up; the worker restores the outbox.
+        run_retry(&client, &events);
+        let mut retry_at = Instant::now();
         // Block for commands, but wake periodically to run the resend queue.
         loop {
-            let command = match commands.recv_timeout(RETRY_TICK) {
+            if retry_at.elapsed() >= RETRY_TICK {
+                run_retry(&client, &events);
+                retry_at = Instant::now();
+            }
+            let command = match commands.recv_timeout(RETRY_TICK.saturating_sub(retry_at.elapsed()))
+            {
                 Ok(command) => command,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    run_retry(&client, &events);
-                    // Sent-folder copies and failed cleanup may not wake INBOX IDLE.
-                    if burn {
-                        run_sync(&client, &mailbox, &events, burn);
-                    }
-                    continue;
-                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             };
             match command {
@@ -192,9 +193,15 @@ fn spawn_worker(
                     let _ = events.send(Event::SessionUpdated(to));
                     send_sessions(&client, &events);
                 }
+                Command::FlushRequests => run_retry(&client, &events),
                 Command::Sync => run_sync(&client, &mailbox, &events, burn),
                 Command::AddContact(address) => {
-                    let _ = client.add_contact(&address);
+                    match client.exchange_key(&address) {
+                        Ok(()) => run_retry(&client, &events),
+                        Err(err) => {
+                            let _ = events.send(Event::Status(format!("好友请求失败: {err:#}")));
+                        }
+                    }
                     send_sessions(&client, &events);
                 }
                 Command::Trust(contact) => {
@@ -245,6 +252,18 @@ fn spawn_worker(
 
 /// Run one pass of the automatic resend queue and report progress.
 fn run_retry(client: &ChatClient, events: &Sender<Event>) {
+    match client.retry_key_requests() {
+        Ok(changed) if !changed.is_empty() => {
+            for contact in changed {
+                let _ = events.send(Event::SessionUpdated(contact));
+            }
+            send_sessions(client, events);
+        }
+        Err(err) => {
+            let _ = events.send(Event::Status(format!("好友请求重试失败: {err:#}")));
+        }
+        _ => {}
+    }
     match client.retry_pending() {
         Ok(changed) if !changed.is_empty() => {
             let _ = events.send(Event::Status(format!(
@@ -273,6 +292,7 @@ fn spawn_watcher(
     thread::spawn(move || {
         let sync_events = events.clone();
         let sessions_client = client.clone();
+        let recovery_client = client.clone();
         client.watch(
             &mailbox,
             burn,
@@ -292,6 +312,11 @@ fn spawn_watcher(
                 send_sessions(&sessions_client, &sync_events);
             },
             move |status| {
+                if status.starts_with("listening (")
+                    && let Err(err) = recovery_client.wake_key_requests()
+                {
+                    let _ = events.send(Event::Status(format!("恢复好友请求失败: {err:#}")));
+                }
                 crate::logging::info("watch", "status", &[("state", &status)]);
                 let _ = events.send(Event::WatcherStatus(status.to_string()));
             },

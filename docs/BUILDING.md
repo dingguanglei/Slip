@@ -40,6 +40,15 @@ Ubuntu 发布构建使用 glibc 2.35 作为后端基线，应在 Ubuntu 22.04 �
 
 macOS 的 Electron 44 要求 macOS 13+。ZIP 保留应用包内的符号链接与执行权限。开发者签名和 Apple 公证需要发行者自行配置；当前自动化不包含签名凭证。
 
+## GitHub 自动编译与出包
+
+- 推送到 `main`：自动运行格式、Clippy、Rust 构建及 JavaScript 检查，通过后构建 macOS ARM64、Windows x64、Ubuntu ARM64 和 Ubuntu x64 安装包。
+- 向 `main` 提交 PR：运行源码检查；合并后自动出包。
+- 手动构建：在 GitHub Actions 的 **Build → Run workflow** 中选择分支。
+- 推送 `v*` 版本标签：复用相同的四平台打包流程，随后上传到 GitHub Releases；标签必须与应用版本匹配。
+
+在 [Build 运行页面](https://github.com/dingguanglei/Slip/actions/workflows/ci.yml) 打开成功的运行，在 **Artifacts** 下载 `Slip-desktop-<提交 SHA>`。其中包含四个平台安装包、`SHA256SUMS` 和记录源码提交的 `BUILD_INFO.txt`，保留 14 天。普通提交的构建包使用源码中的应用版本号，以提交 SHA 区分；不会覆盖或创建正式 Release。
+
 ## 发布流程
 
 1. 同步 `Cargo.toml`、`Cargo.lock`、`desktop/package.json`、锁文件和更新记录中的版本。

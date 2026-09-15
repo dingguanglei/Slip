@@ -8,7 +8,10 @@ use slip::{ChatClient, Engine, Event, MailCache, MailConfig, MailCore};
 use std::{
     collections::BTreeMap,
     io::Read,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
@@ -16,10 +19,30 @@ struct Account {
     client: ChatClient,
     engine: Mutex<Option<Engine>>,
     status: Mutex<String>,
+    revision: Mutex<u64>,
+    changed: Condvar,
+    active: AtomicBool,
 }
+impl Account {
+    fn notify(&self) {
+        let mut revision = self.revision.lock().unwrap();
+        *revision = revision.wrapping_add(1);
+        self.changed.notify_all();
+    }
+}
+
+// At most four long polls occupy the eight HTTP workers.
+struct WaitSlot<'a>(&'a AtomicUsize);
+impl Drop for WaitSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 struct App {
     accounts: Mutex<BTreeMap<String, Arc<Account>>>,
     downloads: Mutex<BTreeMap<String, (std::time::Instant, Vec<u8>)>>,
+    waiters: AtomicUsize,
     token: String,
     host: String,
     cache: MailCache,
@@ -27,6 +50,8 @@ struct App {
 #[derive(Deserialize)]
 struct Action {
     action: String,
+    #[serde(default)]
+    revision: u64,
     #[serde(default)]
     files: Vec<Upload>,
     #[serde(default)]
@@ -167,11 +192,41 @@ fn add_account(app: &App, mut config: MailConfig) -> Result<String> {
         .unwrap()
         .entry(address.clone())
         .or_insert_with(|| {
-            Arc::new(Account {
+            let engine = Engine::start_with_cleanup(client.clone(), "INBOX".into(), true);
+            let account = Arc::new(Account {
                 client,
-                engine: Mutex::new(None),
-                status: Mutex::new("尚未连接".into()),
-            })
+                engine: Mutex::new(Some(engine)),
+                status: Mutex::new("正在连接并补收消息".into()),
+                revision: Mutex::new(1),
+                changed: Condvar::new(),
+                active: AtomicBool::new(true),
+            });
+            let weak = Arc::downgrade(&account);
+            std::thread::spawn(move || {
+                loop {
+                    let Some(account) = weak.upgrade() else {
+                        break;
+                    };
+                    if !account.active.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let mut changed = false;
+                    if let Some(engine) = account.engine.lock().unwrap().as_ref() {
+                        while let Some(event) = engine.try_next() {
+                            if let Event::WatcherStatus(status) = event {
+                                *account.status.lock().unwrap() = status;
+                            }
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        account.notify();
+                    }
+                    drop(account);
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            });
+            account
         });
     Ok(address)
 }
@@ -194,6 +249,8 @@ fn dispatch(app: &App, input: Action) -> Result<Value> {
     if input.action == "logout" {
         let removed = app.accounts.lock().unwrap().remove(&input.account);
         if let Some(account) = removed {
+            account.active.store(false, Ordering::Relaxed);
+            account.notify();
             if let Some(engine) = account.engine.lock().unwrap().take() {
                 engine.shutdown();
             }
@@ -212,23 +269,10 @@ fn dispatch(app: &App, input: Action) -> Result<Value> {
         .cloned()
         .ok_or_else(|| anyhow!("请选择邮箱"))?;
     let client = &account.client;
-    match input.action.as_str() {
+    let result = match input.action.as_str() {
         "state" => {
-            let mut engine = account.engine.lock().unwrap();
-            if engine.is_none() {
-                *engine = Some(Engine::start_with_cleanup(
-                    client.clone(),
-                    "INBOX".into(),
-                    true,
-                ));
-            }
-            if let Some(engine) = engine.as_ref() {
-                while let Some(event) = engine.try_next() {
-                    if let Event::Status(s) | Event::WatcherStatus(s) = event {
-                        *account.status.lock().unwrap() = s;
-                    }
-                }
-            }
+            // Capture before reading: concurrent changes force another refresh.
+            let revision = *account.revision.lock().unwrap();
             let conversation = if input.contact.is_empty() {
                 Value::Null
             } else {
@@ -240,9 +284,31 @@ fn dispatch(app: &App, input: Action) -> Result<Value> {
                 json!(client.contact_info(&input.contact)?)
             };
             Ok(
-                json!({"sessions":client.sessions()?, "conversation":conversation, "info":info,
+                json!({"revision":revision, "sessions":client.sessions()?, "conversation":conversation, "info":info,
                 "status":*account.status.lock().unwrap(), "fingerprint":client.identity_fingerprint(), "public_key":client.identity_public_key()}),
             )
+        }
+        "events" => {
+            app.waiters
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                    (n < 4).then_some(n + 1)
+                })
+                .map_err(|_| anyhow!("通知连接已满，请稍后重试"))?;
+            let _slot = WaitSlot(&app.waiters);
+            let revision = account.revision.lock().unwrap();
+            let (revision, _) = account
+                .changed
+                .wait_timeout_while(revision, std::time::Duration::from_secs(25), |revision| {
+                    *revision == input.revision && account.active.load(Ordering::Relaxed)
+                })
+                .unwrap();
+            Ok(json!({"revision":*revision, "active":account.active.load(Ordering::Relaxed)}))
+        }
+        "resume" => {
+            if let Some(engine) = account.engine.lock().unwrap().as_ref() {
+                engine.send(slip::engine::Command::Sync);
+            }
+            Ok(json!({"ok":true}))
         }
         "info" => Ok(json!(client.contact_info(&input.contact)?)),
         "history" => Ok(json!(client.session(&input.contact)?)),
@@ -252,6 +318,9 @@ fn dispatch(app: &App, input: Action) -> Result<Value> {
         }
         "exchange" => {
             client.exchange_key(&input.contact)?;
+            if let Some(engine) = account.engine.lock().unwrap().as_ref() {
+                engine.send(slip::engine::Command::FlushRequests);
+            }
             Ok(json!({"ok":true}))
         }
         "send" => {
@@ -275,7 +344,14 @@ fn dispatch(app: &App, input: Action) -> Result<Value> {
         }
         "sync" => Ok(json!(client.sync("INBOX", 200, true)?)),
         _ => Err(anyhow!("未知操作")),
+    };
+    if !matches!(
+        input.action.as_str(),
+        "state" | "events" | "info" | "history"
+    ) {
+        account.notify();
     }
+    result
 }
 fn header(name: &str, value: &str) -> Header {
     Header::from_bytes(name, value).unwrap()
@@ -455,6 +531,7 @@ fn main() -> Result<()> {
     let app = Arc::new(App {
         accounts: Mutex::new(BTreeMap::new()),
         downloads: Mutex::new(BTreeMap::new()),
+        waiters: AtomicUsize::new(0),
         token: slip::crypto::random_id(),
         host: format!("127.0.0.1:{port}"),
         cache,

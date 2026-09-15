@@ -391,7 +391,7 @@ const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/add",
-        description: "Add a contact by email",
+        description: "Invite or accept a contact by email",
     },
     SlashCommand {
         name: "/sync",
@@ -625,7 +625,7 @@ impl App {
                 Some(address) if looks_like_email(address.trim()) => {
                     let address = address.trim().to_ascii_lowercase();
                     self.engine.send(Command::AddContact(address.clone()));
-                    self.status = format!("Added {address}.");
+                    self.status = format!("Queued invitation/acceptance for {address}.");
                 }
                 _ => self.status = "Usage: /add <email>".to_string(),
             },

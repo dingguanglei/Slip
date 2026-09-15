@@ -93,6 +93,8 @@ pub struct ChatSyncResult {
     pub key_changes: Vec<String>,
     #[serde(default)]
     pub used_cursor: bool,
+    #[serde(default)]
+    pub requests_changed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -112,6 +114,8 @@ pub struct ChatSessionSummary {
     /// Local display name for this contact, if set.
     #[serde(default)]
     pub alias: Option<String>,
+    #[serde(default)]
+    pub request_status: Option<String>,
 }
 
 /// Key/encryption facts for /info.
@@ -123,6 +127,7 @@ pub struct ContactInfo {
     pub pending_fingerprint: Option<String>,
     pub encrypt_enabled: bool,
     pub encryption_active: bool,
+    pub request_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -203,26 +208,112 @@ impl ChatClient {
         Ok(())
     }
 
-    /// Send only public routing/key material. Never include a user's draft.
+    /// Persist an invitation/acceptance before attempting any network IO.
+    /// The engine delivers it asynchronously and retries after disconnection.
     pub fn exchange_key(&self, address: &str) -> Result<()> {
         let to = normalize_email(address)?;
+        if to == self.account_address {
+            return Err(anyhow!("不能添加自己为好友"));
+        }
         self.add_contact(&to)?;
-        let message = OutgoingSlip {
-            id: crate::crypto::random_id(),
-            ts: now_epoch_seconds_i64(),
-            from: self.account_address.clone(),
-            to: to.clone(),
-            text: String::new(),
-            media: Vec::new(),
-        };
-        let raw = protocol::build_mail(
-            &message,
-            &self.identity,
-            None,
-            self.core.config().subject_marker(),
-        )?;
-        self.remember_wire(&raw)?;
-        self.core.send_raw_mail(&to, &raw)
+        let _guard = self.cache.lock();
+        let mut requests = self.cache.load_requests()?;
+        let known_key = self.cache.load_peers()?.contains_key(&to);
+        let request = requests
+            .entry(to.clone())
+            .or_insert_with(|| crate::cache::KeyRequest {
+                received: known_key,
+                ..Default::default()
+            });
+        request.accepted = true;
+        if request.wire.is_empty() && !request.sent {
+            let message = OutgoingSlip {
+                id: crate::crypto::random_id(),
+                ts: now_epoch_seconds_i64(),
+                from: self.account_address.clone(),
+                to: to.clone(),
+                text: String::new(),
+                media: Vec::new(),
+            };
+            request.wire = protocol::build_mail(
+                &message,
+                &self.identity,
+                None,
+                self.core.config().subject_marker(),
+            )?;
+            self.remember_wire(&request.wire)?;
+        }
+        request.next_attempt = 0;
+        request.updated_at = now_epoch_seconds_i64();
+        self.cache.save_requests(&requests)?;
+        Ok(())
+    }
+
+    /// A recovered mailbox connection should not wait out an old offline backoff.
+    pub fn wake_key_requests(&self) -> Result<()> {
+        let _guard = self.cache.lock();
+        let mut requests = self.cache.load_requests()?;
+        let mut changed = false;
+        for request in requests.values_mut() {
+            if !request.wire.is_empty() && request.next_attempt != 0 {
+                request.next_attempt = 0;
+                changed = true;
+            }
+        }
+        if changed {
+            self.cache.save_requests(&requests)?;
+        }
+        Ok(())
+    }
+
+    pub fn retry_key_requests(&self) -> Result<Vec<String>> {
+        self.retry_key_requests_using(|to, raw| self.core.send_raw_mail(to, raw))
+    }
+
+    /// Flush durable invitations through an explicit transport.
+    pub fn retry_key_requests_using(
+        &self,
+        mut deliver: impl FnMut(&str, &[u8]) -> Result<()>,
+    ) -> Result<Vec<String>> {
+        let requests = self.cache.load_requests()?;
+        let mut changed = Vec::new();
+        for (to, snapshot) in requests {
+            if snapshot.wire.is_empty() || snapshot.next_attempt > now_epoch_seconds_i64() {
+                continue;
+            }
+            // Reserve before IO; a concurrent worker or restart cannot hot-loop.
+            let wire = {
+                let _guard = self.cache.lock();
+                let mut current = self.cache.load_requests()?;
+                let Some(request) = current.get_mut(&to) else {
+                    continue;
+                };
+                if request.wire.is_empty() || request.next_attempt > now_epoch_seconds_i64() {
+                    continue;
+                }
+                request.next_attempt = now_epoch_seconds_i64() + 120;
+                let wire = request.wire.clone();
+                self.cache.save_requests(&current)?;
+                wire
+            };
+            let success = deliver(&to, &wire).is_ok();
+            let _guard = self.cache.lock();
+            let mut current = self.cache.load_requests()?;
+            if let Some(request) = current.get_mut(&to) {
+                if success {
+                    request.wire.clear();
+                    request.sent = true;
+                } else {
+                    request.next_attempt =
+                        now_epoch_seconds_i64() + retry_backoff_secs(request.attempts);
+                    request.attempts = request.attempts.saturating_add(1);
+                }
+                request.updated_at = now_epoch_seconds_i64();
+            }
+            self.cache.save_requests(&current)?;
+            changed.push(to);
+        }
+        Ok(changed)
     }
 
     pub fn add_contact(&self, address: &str) -> Result<Vec<String>> {
@@ -322,6 +413,9 @@ impl ChatClient {
         deliver: impl FnOnce(&str, &[u8]) -> Result<()>,
     ) -> Result<ChatSendResult> {
         let to = normalize_email(to)?;
+        if !self.contact_info(&to)?.encryption_active {
+            return Err(anyhow!("请先接受好友请求并完成公钥交换"));
+        }
         let mut media = Vec::new();
         for path in attachments {
             if !path.is_file() {
@@ -892,7 +986,6 @@ impl ChatClient {
         if incoming.sender_key.is_none() {
             return Ok(false);
         }
-        let known_contact = self.cache.load_contacts()?.contains(&contact);
         let first_key = !self.cache.load_peers()?.contains_key(&contact);
         // Unsolicited invitations never cause automatic email replies.
         self.with_contacts(|contacts| ensure_contact(contacts, &contact))?;
@@ -954,10 +1047,30 @@ impl ChatClient {
             }
         }
 
-        if handshake {
-            if first_key && known_contact {
-                self.exchange_key(&contact)?;
+        if (handshake || first_key || self.cache.load_requests()?.contains_key(&contact))
+            && !flags.iter().any(|flag| flag == "key-changed")
+        {
+            let _guard = self.cache.lock();
+            let mut requests = self.cache.load_requests()?;
+            let legacy_peer = !first_key
+                && !requests.contains_key(&contact)
+                && self
+                    .load_session_lines(&contact)?
+                    .iter()
+                    .any(|line| line.sender == "me" && line.encrypted);
+            let request = requests.entry(contact.clone()).or_default();
+            if legacy_peer {
+                request.accepted = true;
+                request.sent = true;
             }
+            if !request.received {
+                request.received = true;
+                request.updated_at = now_epoch_seconds_i64();
+                result.requests_changed = true;
+            }
+            self.cache.save_requests(&requests)?;
+        }
+        if handshake {
             return Ok(true); // the peer key has been committed to SQLite
         }
         if self
@@ -1087,7 +1200,7 @@ impl ChatClient {
         // deterministic post-connect failure — a corrupt state.json, an
         // unselectable mailbox — cannot spin the loop into a tight reconnect
         // storm that gets the account rate-limited. Backoff resets only after
-        // a fully successful catch-up sync.
+        // a successful IDLE/poll and sync cycle.
         while !stop.load(Ordering::Relaxed) {
             let mut session = match self.core.connect() {
                 Ok(session) => session,
@@ -1105,8 +1218,11 @@ impl ChatClient {
             // Catch up before idling.
             match self.sync_with(&mut session, mailbox, DEFAULT_SYNC_LIMIT, burn_after_save) {
                 Ok(result) => {
-                    backoff = min_backoff;
-                    if result.saved > 0 || !result.new_messages.is_empty() {
+                    if result.saved > 0
+                        || !result.new_messages.is_empty()
+                        || result.requests_changed
+                        || !result.key_changes.is_empty()
+                    {
                         on_sync(&result);
                     }
                 }
@@ -1153,7 +1269,12 @@ impl ChatClient {
                 }
                 match self.sync_with(&mut session, mailbox, DEFAULT_SYNC_LIMIT, burn_after_save) {
                     Ok(result) => {
-                        if result.saved > 0 || !result.new_messages.is_empty() {
+                        backoff = min_backoff;
+                        if result.saved > 0
+                            || !result.new_messages.is_empty()
+                            || result.requests_changed
+                            || !result.key_changes.is_empty()
+                        {
                             on_sync(&result);
                         }
                     }
@@ -1163,6 +1284,9 @@ impl ChatClient {
                     }
                 }
             }
+            session.logout();
+            interruptible_sleep(backoff, stop);
+            backoff = (backoff * 2).min(max_backoff);
         }
     }
 
@@ -1187,6 +1311,7 @@ impl ChatClient {
                 self.cache.load_aliases()?,
             )
         };
+        let requests = self.cache.load_requests()?;
         let mut sessions = Vec::new();
         for contact in contacts {
             // Never list our own address as a conversation partner.
@@ -1194,11 +1319,13 @@ impl ChatClient {
                 continue;
             }
             let lines = self.load_session_lines(&contact)?;
+            let request = requests.get(&contact);
             let updated_at = lines
                 .iter()
                 .map(stored_chat_timestamp)
                 .max()
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .max(request.map(|r| r.updated_at).unwrap_or_default());
             let last_read = state.last_read.get(&contact).copied().unwrap_or(0);
             let incoming_count = lines.iter().filter(|line| line.sender != "me").count();
             let read_count = state.read_counts.get(&contact).copied().unwrap_or_else(|| {
@@ -1210,6 +1337,7 @@ impl ChatClient {
             let unread = incoming_count.saturating_sub(read_count);
             let alias = aliases.get(&contact).cloned();
             sessions.push(ChatSessionSummary {
+                request_status: request.map(|r| r.status().to_string()),
                 contact,
                 messages: lines.len(),
                 updated_at,
@@ -1255,7 +1383,10 @@ impl ChatClient {
         let contact = normalize_email(contact)?;
         let peers = self.cache.load_peers()?;
         let record = peers.get(&contact);
+        let requests = self.cache.load_requests()?;
+        let request = requests.get(&contact);
         Ok(ContactInfo {
+            request_status: request.map(|r| r.status().to_string()),
             address: contact,
             my_fingerprint: self.identity.fingerprint(),
             peer_fingerprint: record.map(|record| record.fingerprint.clone()),
@@ -1263,9 +1394,10 @@ impl ChatClient {
                 .and_then(|record| record.pending_key.as_deref())
                 .and_then(|key| fingerprint_of_b64(key).ok()),
             encrypt_enabled: record.map(|record| record.encrypt).unwrap_or(true),
-            encryption_active: record
-                .map(|record| record.encryption_key().is_some())
-                .unwrap_or(false),
+            encryption_active: request.is_none_or(|r| r.accepted && r.sent && r.received)
+                && record
+                    .map(|record| record.encryption_key().is_some())
+                    .unwrap_or(false),
         })
     }
 
